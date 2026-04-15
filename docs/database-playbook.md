@@ -30,9 +30,9 @@ A scenarios chapter at the end works the other direction: starting from the **pr
 1. [Frame: CAP, PACELC, and why this is the wrong question](#frame)
 2. [PostgreSQL](#postgresql)
 3. [ClickHouse](#clickhouse)
-4. Redis *(coming next)*
-5. Prometheus
-6. Kafka
+4. [Redis](#redis)
+5. [Prometheus](#prometheus)
+6. Kafka *(coming next)*
 7. Apache Iceberg
 8. ZooKeeper
 9. Elasticsearch
@@ -408,4 +408,139 @@ The honest summary: **the engine is free; the operations and the RAM are not.** 
 
 ---
 
-*Next up: Prometheus.*
+---
+
+<a id="prometheus"></a>
+## Prometheus
+
+### Identity
+A pull-based, single-binary, time-series database purpose-built for **operational metrics and alerting**. Born at SoundCloud, modeled on Google's Borgmon, donated to the CNCF, and now the de facto monitoring layer of the cloud-native world. If your service runs in Kubernetes, Prometheus is monitoring it.
+
+### Mental model
+A **polling robot with a notebook of curves**. Every 15 seconds the robot walks down a list of addresses, knocks on each `/metrics` endpoint, copies the numbers into its notebook, and goes home. It does not care who you are or what you do — it cares that you exposed a number it could read. The notebook is shaped for one job: storing numeric time series and answering "what did this curve look like?" fast.
+
+### Pull, not push (and why this matters)
+
+The single most distinctive design decision in Prometheus, and the one that confuses every engineer coming from StatsD or DataDog.
+
+```text
+PUSH MODEL (StatsD, DataDog agent)        PULL MODEL (Prometheus)
+──────────────────────────────────        ────────────────────────
+
+  ┌──────┐                                   ┌──────────────┐
+  │ App  │ ──── metric ───▶ ┌─────────┐      │  Prometheus  │
+  └──────┘                  │ collector│     │   server     │
+  ┌──────┐                  │          │     └──────┬───────┘
+  │ App  │ ──── metric ───▶ │ accepts  │            │ scrape every 15s
+  └──────┘                  │ whatever │            │ GET /metrics
+  ┌──────┐                  │ shows up │            ▼
+  │ App  │ ──── metric ───▶ │          │     ┌──────┐  ┌──────┐  ┌──────┐
+  └──────┘                  └─────────┘     │ App  │  │ App  │  │ App  │
+                                            │ /met │  │ /met │  │ /met │
+  - apps know about collector              └──────┘  └──────┘  └──────┘
+  - bad app can flood you
+  - hard to know who is "alive"           - server discovers targets
+                                          - missing scrape = up{}=0 alert
+                                          - apps are passive
+```
+
+Implications:
+- **Liveness comes free.** A target that doesn't respond is, by definition, in trouble. The `up` metric is the easiest alert in the system.
+- **Service discovery becomes the configuration.** Kubernetes, Consul, EC2 tags — Prometheus pulls the target list from the orchestrator and adapts as pods come and go.
+- **Bad services cannot DDoS your monitoring.** They can only fail to be scraped.
+- **Short-lived jobs are awkward.** A batch job that lives for 30 seconds may never be scraped. Solution: the **Pushgateway** (push to a holding cell, Prometheus scrapes the cell) — for **short-lived jobs only**, not as a general push mechanism.
+
+### Sweet spot
+- **Infrastructure and application metrics.** CPU, memory, request rate, error rate, latency (the four golden signals).
+- **Kubernetes monitoring.** Native integration, label-based service discovery. Prometheus + kube-state-metrics + node-exporter is the standard stack.
+- **Alerting on operational health.** Alertmanager handles routing, grouping, silencing. The combination is what most companies actually use to wake up on-call.
+- **SLI/SLO measurement.** Histograms + recording rules + Grafana = the SRE workflow Google's book describes.
+- **Short-to-medium retention** (15 days default, comfortable to 30–90 days on a single node with tuning).
+- **Pull-friendly environments** where targets expose `/metrics` and live long enough to be scraped.
+
+### Don't use it for
+- **Logs.** Prometheus stores numbers, not text. Use Loki, Elasticsearch, or ClickHouse for logs.
+- **Distributed traces.** Use Jaeger, Tempo, or Honeycomb. Prometheus has no concept of a span.
+- **Business analytics.** "How much revenue did we make in Q3?" is not a Prometheus question. The data model (downsampled, dropped on retention boundary, lossy at ingest) is wrong for finance and BI.
+- **Event data.** Prometheus stores **sampled** values at scrape intervals — if a counter ticks 1,000 times between scrapes, you see a delta of 1,000, not 1,000 events. For per-event analytics, use a real event store.
+- **Long-term storage at scale** (years of metrics across thousands of services). Single-node Prometheus is not designed for this; use **Thanos, Cortex, Mimir, or VictoriaMetrics** as the long-term/global layer.
+- **High-cardinality dimensions.** This is *the* anti-pattern. Read on.
+- **Push-from-everywhere** workloads. Pushgateway is for batch jobs only; using it as a general push endpoint defeats every Prometheus design assumption.
+
+### How it breaks at scale
+
+```text
+   scale →   100 services  1K services  10K targets   100M series   long-term
+              │             │             │             │             │
+  cliff:   ┌──┴──┐       ┌──┴──┐       ┌──┴──┐       ┌──┴──┐       ┌──┴──┐
+           │Cardi│       │ WAL │       │Federa│      │Single│      │Reten-│
+           │nality│      │replay│      │tion  │      │node  │      │tion +│
+           │explo│       │slow  │      │pain  │      │OOM   │      │global│
+           │sion │       │      │      │      │      │      │      │view  │
+           └─────┘       └──────┘      └──────┘      └──────┘      └─────┘
+   fix:  Audit labels   Tune WAL,    Hierarchical   Shard by      Thanos /
+         + relabel      faster disk  federation     team/cluster; Mimir /
+         drops          (NVMe)       OR skip to     vertical-     VictoriaMetrics
+                                     Thanos/Mimir   scale node
+```
+
+#### The cardinality bomb (the cliff that wrecks every team once)
+
+Every unique combination of label values is a separate time series, stored as its own file group on disk and held in memory. The math is unforgiving:
+
+```text
+metric: http_requests_total{method, status, endpoint, ...}
+
+  3 methods × 10 statuses × 50 endpoints     = 1,500 series       ✓ fine
+  + 100 instances                            = 150,000 series     ✓ ok
+  + region label (5 regions)                 = 750,000 series     ⚠ getting heavy
+  + customer_id label (10,000 customers)     = 7,500,000,000 series  💥 dead
+```
+
+Adding `customer_id`, `user_id`, `request_id`, or any unbounded label to a metric is the single most common way teams kill their Prometheus. Memory goes vertical, queries time out, restarts take hours replaying the WAL. **High-cardinality dimensions belong in logs or traces, not metrics.** Repeat this in every code review.
+
+1. **Cardinality explosion (the first cliff, hits early).** Audit labels constantly. Use `metric_relabel_configs` to drop bad labels at scrape time. If your `prometheus_tsdb_head_series` metric is climbing without bound, you have a problem now, not later.
+
+2. **WAL replay on restart.** Prometheus rebuilds memory state from the write-ahead log on startup. At hundreds of millions of series, this can take 30+ minutes. Tune WAL size, use NVMe, run HA pairs so one is always up.
+
+3. **Federation pain.** "Just have a top-level Prometheus scrape the others" works at small scale and falls apart at large scale — the federated server becomes a bottleneck, label collisions appear, and global queries are slow. Most large deployments skip federation entirely and go to Thanos/Mimir/VictoriaMetrics.
+
+4. **Single-node ceiling.** Prometheus is intentionally single-node — no clustering. You scale by **sharding**: separate Prometheus per team, per cluster, per environment. Vertical scaling (more CPU/RAM/NVMe) buys time, but the ceiling is real around ~10M active series per server.
+
+5. **Long-term retention requires another system.** Default retention is 15 days. To keep months or years of metrics queryable, you need an object-storage backend: **Thanos** (Improbable, open source), **Cortex / Mimir** (Grafana Labs), or **VictoriaMetrics** (drop-in replacement, often faster). Pick one early; bolting it on later is migration pain.
+
+### What seniors watch for
+- **Any new label whose values are not bounded by a small set known at deploy time.** `status="200|400|500"` is fine; `customer_id` is a fireable offense.
+- **Histograms with too many buckets** — each bucket is a series. 50 buckets × 100 endpoints × 100 instances = 500K series for one metric.
+- **Summaries used where histograms should be.** Summaries cannot be aggregated across instances (the percentile is computed locally and is mathematically wrong to add). Histograms can. Default to histograms.
+- **Recording rules missing for expensive PromQL.** A `rate(http_requests_total[5m])` over 1M series, evaluated every dashboard refresh, is wasted compute. Pre-compute it as a recording rule.
+- **No HA pair.** Prometheus is single-node. Production HA = run two identical Prometheus servers scraping the same targets, with deduplication at the query layer (Thanos Querier, Promxy).
+- **Alerts that fire on raw scrape gaps** instead of `for: 5m`. Single missed scrape during a deploy → page → trust in alerts erodes.
+- **Pushgateway used as a general push API.** It is designed for batch jobs and breaks the pull model's liveness signal.
+- **Scrape interval set to 1 second "for accuracy."** You just multiplied your storage and CPU by 15. 15 seconds is the right default; faster is rarely worth it.
+- **Direct PromQL in Grafana dashboards** that other dashboards also use. Move it to a recording rule once it's shared.
+
+### Cost & ops burden
+
+| Flavor | Cost (relative) | Ops burden | When it's the right answer |
+|---|---|---|---|
+| **Self-managed Prometheus** | 1× | Low–medium — single binary, but you own scaling and HA | Default for any team running Kubernetes |
+| **Self-managed + Thanos / Mimir / VictoriaMetrics** | 1.5–2× | Medium-high — multi-component distributed system | Need long-term retention or global query view |
+| **Grafana Cloud (managed Mimir)** | 3–6× | Low — they run the storage and global query layer | Want managed; already on Grafana stack |
+| **Amazon Managed Prometheus (AMP)** | 3–5× | Low — AWS-native, integrates with IAM | AWS-only, want managed without leaving the cloud |
+| **Chronosphere** | 5–10× | Low — high-end managed M3-based | Massive scale (>100M active series), cardinality controls as a feature |
+| **VictoriaMetrics (self or managed)** | 0.5–1× of Prometheus storage | Low–medium — drop-in remote write target | Cost-sensitive, single-binary preference, faster query than Prometheus on big data |
+
+The honest summary: **Prometheus itself is free and easy. The ecosystem you bolt around it for retention and global view is where cost and complexity live.** VictoriaMetrics is the under-the-radar pick that more senior teams reach for when they want Prometheus semantics without Thanos's operational weight.
+
+### War stories
+- **SoundCloud — birthplace (2012).** Built Prometheus to replace a homegrown StatsD-style system that couldn't handle their service-oriented architecture. Donated to CNCF in 2016. Public posts and the *Site Reliability Engineering* book (Google) describe the inspiration from Borgmon. Lesson: **the pull model wasn't a preference, it was a response to a specific operational pain — services that were hard to inventory and easy to flood.**
+- **Cloudflare — metrics at edge scale.** Runs Prometheus across hundreds of edge locations with VictoriaMetrics for long-term storage. Public engineering blog covers their scale challenges and the cardinality discipline they enforce. Lesson: **at edge scale, VictoriaMetrics often beats Prometheus + Thanos on both cost and query speed.**
+- **Uber — built M3 instead.** Outgrew Prometheus's single-node model and built **M3DB** as a distributed metrics platform. Public posts describe handling tens of billions of metrics. Lesson: **Prometheus is excellent until you need a true distributed metrics database; at that point, you either adopt one (Mimir/Thanos/M3) or write one. Most companies should adopt.**
+- **Shopify — Thanos at scale.** Public posts describe their Prometheus + Thanos setup handling Black Friday spikes and multi-region observability. Lesson: **the pattern is "Prometheus per cluster, Thanos for global query and long-term store" — it is the closest thing to a default architecture in cloud-native ops.**
+- **GitLab — public monitoring stack.** GitLab.com publishes their entire Prometheus + Thanos config and dashboards. Lesson: **reading other teams' monitoring config is one of the highest-leverage learning moves an engineer can make. GitLab's is open.**
+- **The cautionary tale — every team, once.** The single most common Prometheus incident is the same one: an engineer adds a label like `request_id` or `customer_email` to a high-traffic metric, ships, and the Prometheus host OOMs within hours. There is no famous public post-mortem because every team has lived this story privately. Make it part of your code-review checklist.
+
+---
+
+*Next up: Kafka.*
