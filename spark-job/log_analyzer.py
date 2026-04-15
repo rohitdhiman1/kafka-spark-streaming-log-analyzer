@@ -7,6 +7,7 @@ from pyspark.sql.types import IntegerType, StringType, StructField, StructType, 
 # Kafka settings are loaded from environment for easy Docker Compose wiring.
 BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "broker:29092")
 TOPIC = os.getenv("KAFKA_TOPIC", "web-logs")
+SLOW_REQUEST_THRESHOLD_MS = int(os.getenv("SLOW_REQUEST_THRESHOLD_MS", "1000"))
 
 
 # Explicit schema for incoming JSON payload from Kafka.
@@ -94,7 +95,7 @@ top_endpoints_query = (
 )
 
 # Query 3: Slow request alert stream.
-slow_requests = logs.filter(F.col("response_time_ms") > 1000)
+slow_requests = logs.filter(F.col("response_time_ms") > SLOW_REQUEST_THRESHOLD_MS)
 
 slow_query = (
     slow_requests.writeStream.outputMode("update")
