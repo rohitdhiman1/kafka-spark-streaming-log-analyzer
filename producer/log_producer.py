@@ -55,7 +55,8 @@ def make_event() -> dict:
 
 def wait_for_kafka(timeout_seconds: int = 120) -> None:
     """Wait until Kafka broker is reachable before starting the producer."""
-    host, port = BOOTSTRAP_SERVERS.split(":")
+    first_broker = BOOTSTRAP_SERVERS.split(",")[0].strip()
+    host, port = first_broker.rsplit(":", 1)
     port = int(port)
     deadline = time.time() + timeout_seconds
 
