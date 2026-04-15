@@ -89,7 +89,41 @@ A **library with a meticulous head librarian**. Every book has a place, every re
 ### How it breaks at scale
 The Postgres scaling story has predictable cliffs. Knowing them is the difference between a senior and a staff engineer.
 
+```text
+   scale →    100 GB        1 TB         10 TB        50 TB        100 TB+
+              │             │             │             │             │
+  cliff:   ┌──┴──┐       ┌──┴──┐       ┌──┴──┐       ┌──┴──┐       ┌──┴──┐
+           │ Conn│       │Vacuum│      │Schema│      │Write │      │Shard│
+           │storm│       │/bloat│      │migrtn│      │ceiling│      │ or  │
+           └─────┘       └──────┘      └──────┘      └──────┘      │bust │
+                                                                    └─────┘
+   fix:  PgBouncer    Tune autovac   gh-ost-style    Read replicas  Notion/
+         (always)     + pg_repack    online migrn    (reads only)   Figma-
+                                                                    style
+                                                                    sharding
+```
+
 1. **Connection storm (the first cliff, hits early).** Each connection is a forked OS process holding ~10 MB. At 500+ connections the system thrashes. The fix is non-negotiable: **PgBouncer** (or pgcat) in transaction-pooling mode, sitting between every app and the database. Teams that skip this re-discover the problem at 2 a.m. during a launch.
+
+   ```text
+   Without PgBouncer (breaks ~500 conns)         With PgBouncer (handles 10K+)
+   ────────────────────────────────────          ──────────────────────────────
+        app pods                                       app pods
+   ┌───┐ ┌───┐ ┌───┐ ┌───┐ ... 1000s            ┌───┐ ┌───┐ ┌───┐ ... 1000s
+     │     │     │     │                          │     │     │
+     └──┬──┴──┬──┴──┬──┴──┐                       └──┬──┴──┬──┴──┐
+        ▼     ▼     ▼     ▼                          ▼     ▼     ▼
+     ┌─────────────────────┐                      ┌──────────────┐
+     │     Postgres        │                      │  PgBouncer   │  ← pools
+     │ 1000 forked procs   │ ← 10GB RAM gone      │  100 actual  │    & multiplexes
+     │  thrashing          │                      │  conns       │
+     └─────────────────────┘                      └──────┬───────┘
+                                                         ▼
+                                                  ┌──────────────┐
+                                                  │   Postgres   │
+                                                  │  ~50 procs   │
+                                                  └──────────────┘
+   ```
 
 2. **Vacuum and bloat.** MVCC means updates and deletes leave dead tuples that `VACUUM` cleans up. On large, hot tables the autovacuum cannot keep up; bloat eats disk and slows queries. Worst case: **transaction ID wraparound**, which can take the database offline. Sentry famously hit this; their post-mortem ("Transaction ID Wraparound: A Postgres Horror Story") is required reading.
 
@@ -109,10 +143,15 @@ The Postgres scaling story has predictable cliffs. Knowing them is the differenc
 - **Cross-shard queries** in a sharded setup. If you find yourself writing them often, the shard key is wrong.
 
 ### Cost & ops burden
-- **Self-managed:** cheapest per GB, highest ops cost. Needs a DBA-shaped human or team once you cross ~10 TB or HA-critical territory.
-- **Managed (RDS, Cloud SQL, Azure):** ~2–3× the raw infra cost; eliminates 80% of the operational pain. The default sane choice for most teams under ~100 engineers.
-- **Aurora Postgres:** ~3–5× self-managed cost. Buys you a distributed storage layer (6-way replication across 3 AZs) and faster failover. Worth it for revenue-critical workloads until you are huge enough to build the equivalent yourself.
-- **CockroachDB / Yugabyte:** Postgres-compatible distributed SQL. Pay 2–4× the latency and significantly more in license/infra. Buy them when global multi-region writes or unbounded horizontal scale is a hard requirement, not before.
+
+| Flavor | Cost (relative) | Ops burden | When it's the right answer |
+|---|---|---|---|
+| **Self-managed** | 1× | High — needs a DBA-shaped human past ~10 TB or HA-critical | Cost-sensitive, in-house expertise exists |
+| **RDS / Cloud SQL / Azure** | 2–3× | Low — backups, failover, patching handled | Default sane choice for teams under ~100 engineers |
+| **Aurora Postgres** | 3–5× | Low — plus 6-way replicated storage, faster failover | Revenue-critical workloads; not yet huge enough to build the equivalent |
+| **CockroachDB / Yugabyte** | 5–10× + license | Medium-high — distributed system ops | Global multi-region active-active is a hard requirement, not a nice-to-have |
+
+The trap is buying the next tier "to be safe." Each step up costs real money and real complexity; only pay for the constraint you actually have.
 
 ### War stories
 - **Notion — sharding Postgres (2021).** Outgrew a single primary holding their block storage. Sharded into 32 logical shards (later 96, then 480) using a deterministic hash on workspace ID. Public post: *"Herding elephants: lessons learned from sharding Postgres at Notion."* The lesson everyone quotes: **shard before you have to, because sharding under fire is the worst project of your year.**
