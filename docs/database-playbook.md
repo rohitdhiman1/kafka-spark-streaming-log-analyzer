@@ -32,8 +32,8 @@ A scenarios chapter at the end works the other direction: starting from the **pr
 3. [ClickHouse](#clickhouse)
 4. [Redis](#redis)
 5. [Prometheus](#prometheus)
-6. Kafka *(coming next)*
-7. Apache Iceberg
+6. [Kafka](#kafka)
+7. Apache Iceberg *(coming next)*
 8. ZooKeeper
 9. Elasticsearch
 10. Cassandra
@@ -543,4 +543,151 @@ The honest summary: **Prometheus itself is free and easy. The ecosystem you bolt
 
 ---
 
-*Next up: Kafka.*
+---
+
+<a id="kafka"></a>
+## Kafka
+
+### Identity
+A distributed, partitioned, replicated, **append-only commit log** designed at LinkedIn in 2011 to move billions of events per day between services. Donated to Apache, now the de facto backbone of event-driven architectures and stream processing. The label "message broker" undersells it; Kafka is closer to "a database whose only API is `INSERT INTO log`."
+
+### Mental model
+A **bank of distributed tape recorders**. Producers append events to the end of the tape. The tapes (topics) are split into parallel reels (partitions) spread across machines, each reel mirrored on N machines for durability. Consumers can press play anywhere on any reel — at the end for live data, in the middle to replay history, at the beginning to rebuild state from scratch. The tape stays around for as long as you tell it to (seven days by default; forever if you want).
+
+The single most important reframe: **Kafka is not a queue. It is a log.**
+
+```text
+QUEUE (RabbitMQ, SQS)                    LOG (Kafka)
+─────────────────────                    ───────────
+
+  ┌────────┐                               ┌──────────────────────────┐
+  │  msg   │ ── consumed ──▶ gone          │ msg msg msg msg msg msg  │ ← tape
+  │  msg   │                               └──────────────────────────┘
+  │  msg   │                                ▲       ▲       ▲
+  │  msg   │                                │       │       │
+  └────────┘                            consumer  consumer  consumer
+                                          A       B       C
+                                       (offset 0) (offset 4) (offset 6)
+  - one consumer per message            - many consumers, independent positions
+  - message gone after ack              - messages stay for retention period
+  - "did this get processed?"           - "what was the world like at offset N?"
+  - good for work distribution          - good for event distribution + replay
+```
+
+This distinction explains every Kafka design choice. Replay, multiple independent consumer groups, exactly-once semantics, stream processing, event sourcing — all flow from "the log is the source of truth, consumers are projections."
+
+### How partitions actually work (the picture every Kafka engineer carries)
+
+```text
+TOPIC: orders   (replication.factor=3, partitions=4)
+                                              ┌──────────────────┐
+producer ──┐                                  │ consumer group A │
+           │   ┌──────────────────────────┐   │  (each partition │
+           │   │ partition 0   ▶ broker 1 │ ◀─┤   to one         │
+           │   │              + broker 2  │   │   consumer)      │
+           │   │              + broker 3  │   │  c1 → p0,p1      │
+           │   ├──────────────────────────┤   │  c2 → p2,p3      │
+           ├──▶│ partition 1   ▶ broker 2 │ ◀─┘                  │
+key=user42 │   │              + broker 3  │   ┌──────────────────┐
+hash → 1   │   │              + broker 1  │   │ consumer group B │
+           │   ├──────────────────────────┤ ◀─┤ (independent     │
+           │   │ partition 2   ▶ broker 3 │   │  offsets, can    │
+           │   │              + broker 1  │   │  replay history) │
+           │   │              + broker 2  │   └──────────────────┘
+           │   ├──────────────────────────┤
+           │   │ partition 3   ▶ broker 1 │
+           │   │              + broker 2  │
+           │   │              + broker 3  │
+           │   └──────────────────────────┘
+           │
+       partition = hash(key) % num_partitions
+       same key → same partition → ordered for that key
+       no key → round-robin → no ordering guarantee
+```
+
+Two facts to memorize:
+1. **Ordering is per-partition, never per-topic.** Two events with different keys may arrive at consumers in any relative order. Engineers who assume global ordering ship subtle bugs that surface months later.
+2. **A consumer group has at most one consumer per partition.** Want more parallelism? Add partitions. Adding consumers beyond partition count gives you idle consumers, not more throughput.
+
+### Sweet spot
+- **Event backbone between services.** The "central nervous system" pattern: producers fire events, any number of consumers subscribe independently, services decouple cleanly.
+- **Stream processing source.** Spark Streaming, Flink, Kafka Streams, ksqlDB all consume from Kafka as the canonical input.
+- **Change data capture (CDC).** Debezium reads Postgres/MySQL WAL and emits change events to Kafka. Downstream systems (search index, cache, warehouse) update without polling the source database.
+- **Log aggregation at firehose scale.** Application logs, metrics, audit trails — collect into Kafka, fan out to S3/Iceberg, ClickHouse, Elasticsearch.
+- **Event sourcing.** The log is the source of truth; current state is a projection. Replay rebuilds state.
+- **Decoupling producers from consumer cadence.** Producer can fire 1M events/sec; slow consumer reads at 10K/sec; Kafka holds the difference for days.
+
+### Don't use it for
+- **Request/response.** Kafka is async by design. RPC over Kafka exists but is a misuse — use gRPC, HTTP, or a proper RPC framework.
+- **Small workloads.** Three services exchanging a thousand messages a day? Kafka is overkill. SQS, Redis Streams, RabbitMQ, or even a Postgres table are simpler.
+- **Per-message workflows with priorities, delays, dead-letter routing.** Kafka has no native priority, no delayed delivery, and DLT (dead-letter topic) is a pattern you build yourself. Real queues — RabbitMQ, SQS, ActiveMQ — are better at queue semantics.
+- **Strict global ordering.** Single-partition topics give you ordering at the cost of zero parallelism. Pick one.
+- **As a database for queries.** Kafka cannot answer "what is the current value for key X" without scanning the log. Compacted topics give you the latest value per key but no query capability beyond that. Project to a real database.
+- **Storing data forever as the only copy.** Tiered storage (Confluent, Apache 3.6+) helps, but for long-term analytical history, land it in Iceberg/Parquet on object storage and let Kafka be the hot path.
+- **Tiny clusters at large companies.** Below ~100 MB/s sustained, you are paying Kafka's operational tax for nothing.
+
+### How it breaks at scale
+
+```text
+   scale →   1 MB/s        100 MB/s     1 GB/s        multi-cluster  multi-region
+              │             │             │             │             │
+  cliff:   ┌──┴──┐       ┌──┴──┐       ┌──┴──┐       ┌──┴──┐       ┌──┴──┐
+           │ Hot │       │Conu-│       │ ZK / │      │Rebal-│      │Mirror│
+           │ par-│       │mer  │       │KRaft │      │ance  │      │Maker │
+           │tition│      │ lag │       │ load │      │storms│      │cost  │
+           └─────┘       └──────┘      └──────┘      └──────┘      └─────┘
+   fix:  Better key,   Scale conc,   KRaft mode    Cooperative-   Cluster
+         more parts,   add parts,    (no ZK),      sticky         Linking
+         hash-mod      faster        bigger ZK     assignor,      (Confluent)
+         partition     processing    ensemble      static membr   or accept
+                                                                  per-region
+```
+
+1. **Hot partitions (the first cliff, hits early).** Partition is `hash(key) % num_partitions`. Pick a key that skews — say `customer_id` where one customer is 50% of traffic — and one broker melts while the others idle. **Fix: choose keys with high cardinality and even distribution. If you must use a skewed key, salt it (`key = original_key + random_suffix`) and accept the loss of per-original-key ordering.**
+
+2. **Consumer lag spirals.** A slow consumer falls behind, the lag grows, the lag triggers an alert, the team adds consumers — and discovers consumers beyond partition count do nothing. **Fix: lag is a partition-count problem and a processing-speed problem, not a consumer-count problem. Plan partition counts for peak throughput from day one (changing them later is painful).**
+
+3. **ZooKeeper bottleneck (legacy) → KRaft transition (modern).** Classic Kafka used ZooKeeper for metadata; ZK became the bottleneck above ~200K partitions per cluster. KIP-500 replaced ZK with **KRaft** (Kafka's own Raft-based metadata layer). New deployments should be KRaft from day one; existing deployments face a migration project. ZK removal is **complete in Apache Kafka 4.0**.
+
+4. **Rebalance storms.** When a consumer joins or leaves, the group rebalances — and historically all consumers stopped consuming during the rebalance. At high churn (Kubernetes pod restarts, scaling events), throughput tanks. **Fix: cooperative-sticky assignor (Kafka 2.4+) does incremental rebalances; static membership avoids rebalance on planned restarts.**
+
+5. **Cross-region pain.** MirrorMaker 2 replicates topics between clusters but doubles your storage cost, doubles network egress (the real cost), and offsets are not preserved across clusters by default. **Fix: Confluent Cluster Linking, or accept region-local clusters with application-level routing. Or switch to alternatives like Pulsar that have geo-replication built in.**
+
+6. **The "we use Kafka as a database" trap.** Compacted topics give you "latest value per key" forever, which feels like a database. It is not. No secondary indexes, no point queries beyond key lookup via a separate consumer rebuild, no transactional updates across keys. Teams that build on this discover the limits at the worst time.
+
+### What seniors watch for
+- **Partition key choice.** This is the single most consequential schema decision in Kafka. Bad keys cause hot partitions; ordering assumptions on the wrong key cause subtle correctness bugs. Reviewed line by line in mature teams.
+- **Partition count chosen casually.** Default of 1 or 3 is almost always wrong. Calculate from peak throughput (~10 MB/s per partition is a reasonable rule of thumb) and consumer parallelism needs. Plan for 12 months of growth.
+- **`acks=1` in production.** That means the producer waits for the leader to ack, not the replicas. A leader crash loses data. **Production default: `acks=all` + `min.insync.replicas=2` + `replication.factor=3`. The durability triangle.** Trading any of these for throughput should be a deliberate, documented decision.
+- **No Schema Registry.** Producers and consumers evolve schemas independently; the log fills with incompatible payloads; a downstream consumer breaks at 3 a.m. when an old message reappears. Avro/Protobuf + Schema Registry is the standard answer.
+- **Exactly-once semantics misunderstood.** Kafka's EOS works *within* Kafka (transactional producer + consumer with `read_committed`). It does **not** automatically extend to your database write. Idempotent consumer logic is still your job.
+- **No dead-letter topic strategy.** Poison messages crash consumers in a loop. Standard pattern: try N times, then publish to `<topic>.dlt`, alert, and continue.
+- **Topic naming chaos.** No conventions = no ownership = no cleanup. Mature shops enforce `<domain>.<entity>.<event>` or similar.
+- **Confluent license drift.** Many "Kafka" components (KSQL, Schema Registry, some connectors) are under the Confluent Community License, not Apache 2.0. Read the license before building on them; alternatives exist (Apicurio Registry, Karapace).
+- **Tiered storage assumptions.** Open-source tiered storage (Apache Kafka 3.6+) is newer than Confluent's. Test the failover paths before betting durability on them.
+
+### Cost & ops burden
+
+| Flavor | Cost (relative) | Ops burden | When it's the right answer |
+|---|---|---|---|
+| **Self-managed Apache Kafka** | 1× | Very high — brokers, ZK/KRaft, monitoring, upgrades, rebalances | Have dedicated streaming/data platform team |
+| **AWS MSK** | 2–3× | Medium — AWS handles brokers, you handle topics/clients | AWS-native, want managed brokers without leaving the cloud |
+| **Confluent Cloud** | 4–8× | Low — full managed, includes Schema Registry, Connect, ksqlDB | Want everything managed; can pay for it |
+| **Redpanda** | 1–2× infra | Low–medium — single binary, no ZK, Kafka API-compatible | Want simpler ops, lower latency, smaller footprint |
+| **WarpStream / Bufstream (S3-backed)** | 0.2–0.5× egress savings | Low — stateless brokers, data in S3 | Cost-sensitive, ok with higher latency, multi-AZ egress is your big bill |
+| **Apache Pulsar** | 1× | High — different architecture (BookKeeper + brokers) | Need built-in multi-tenancy, geo-replication, queue semantics + log semantics |
+
+The honest summary: **Kafka's operational cost is the dominant factor.** A self-managed cluster needs a team that knows it. Below ~100 MB/s sustained and a real engineering investment, **managed (MSK, Confluent Cloud) almost always wins on TCO.** The newer S3-backed alternatives (WarpStream, Bufstream, Confluent's Freight tier) are reshaping the cost curve specifically by killing inter-AZ replication egress, which is often 70%+ of a cloud Kafka bill.
+
+### War stories
+- **LinkedIn — birthplace (2011).** Built Kafka to replace a tangle of point-to-point service integrations and batch ETL pipelines. Jay Kreps's foundational essay *"The Log: What every software engineer should know about real-time data's unifying abstraction"* is required reading. Lesson: **the log abstraction unifies messaging, integration, and storage. Internalize this and most distributed systems get easier.**
+- **Netflix — event-driven backbone.** Runs Kafka at multi-trillion events/day across video playback telemetry, A/B testing, and microservice events. Public posts cover their Kafka-on-AWS optimizations and the move toward open-source contributions. Lesson: **Kafka is the data plane for telemetry-heavy companies; trying to use a relational database here would be malpractice.**
+- **Uber — uReplicator and the cross-region story.** Open-sourced uReplicator after MirrorMaker 1 couldn't keep up with cross-region needs. Public posts describe the operational complexity. Lesson: **cross-region Kafka is hard. If you need it, plan for it as a distinct project, not a config flag.**
+- **Pinterest — Singer (log forwarder) → Kafka → MemQ.** Built Singer to ship logs reliably into Kafka, then later built MemQ as an S3-backed Kafka alternative for cost reasons. Public posts cover the migration. Lesson: **at huge scale, the inter-AZ network bill becomes the deciding factor in the architecture.**
+- **Slack — outage from a Kafka misconfiguration (2021).** Public post-mortems describe how Kafka issues compounded into broader platform failures. Lesson: **Kafka sits in the critical path of more things than you think. Treat it as Tier-0 infrastructure.**
+- **Confluent's KIP-500 (2019–2024).** Five-year project to remove ZooKeeper from Kafka, replaced by KRaft. The fact that it took five years and dominated the Kafka roadmap tells you how deeply ZooKeeper was woven into the system. Lesson: **architectural debt in distributed systems is paid in years, not sprints. New deployments: KRaft from day one.**
+- **The cautionary tale — Robinhood (2020 surge).** During the GameStop trading frenzy, multiple infrastructure layers struggled, including event pipelines. Public reporting points to Kafka-related backpressure as one of several factors. Lesson: **load-test your event pipeline at 5× peak, not 1.5×. The hot-partition surprise lives in tail traffic, not average traffic.**
+
+---
+
+*Next up: Apache Iceberg.*
