@@ -33,8 +33,8 @@ A scenarios chapter at the end works the other direction: starting from the **pr
 4. [Redis](#redis)
 5. [Prometheus](#prometheus)
 6. [Kafka](#kafka)
-7. Apache Iceberg *(coming next)*
-8. ZooKeeper
+7. ZooKeeper *(coming next)*
+8. Apache Iceberg
 9. Elasticsearch
 10. Cassandra
 11. Scenarios — payments, e-commerce, Black Friday, search, observability, data lake, leaderboards, fraud, recommendations, multi-tenant SaaS
@@ -687,6 +687,139 @@ The honest summary: **Kafka's operational cost is the dominant factor.** A self-
 - **Slack — outage from a Kafka misconfiguration (2021).** Public post-mortems describe how Kafka issues compounded into broader platform failures. Lesson: **Kafka sits in the critical path of more things than you think. Treat it as Tier-0 infrastructure.**
 - **Confluent's KIP-500 (2019–2024).** Five-year project to remove ZooKeeper from Kafka, replaced by KRaft. The fact that it took five years and dominated the Kafka roadmap tells you how deeply ZooKeeper was woven into the system. Lesson: **architectural debt in distributed systems is paid in years, not sprints. New deployments: KRaft from day one.**
 - **The cautionary tale — Robinhood (2020 surge).** During the GameStop trading frenzy, multiple infrastructure layers struggled, including event pipelines. Public reporting points to Kafka-related backpressure as one of several factors. Lesson: **load-test your event pipeline at 5× peak, not 1.5×. The hot-partition surprise lives in tail traffic, not average traffic.**
+
+---
+
+---
+
+<a id="zookeeper"></a>
+## ZooKeeper
+
+### Identity
+A small, strongly-consistent, distributed **coordination service** built at Yahoo! and donated to Apache. Stores tiny pieces of shared state (typically a few KB per node) that an entire cluster of machines can agree on, with strict ordering, durable updates, and a notification mechanism. Not a database in the sense the rest of this doc means; closer to a **distributed kernel primitive** for building distributed systems.
+
+### Mental model
+A **tiny, very reliable filesystem that the entire cluster sees identically**. Paths are called znodes; they form a hierarchy like `/services/payments/leader`. Any client can read, write, watch, or delete a znode, and every client sees writes in the same order. The filesystem is replicated across an odd number of servers (an ensemble) using the **ZAB (ZooKeeper Atomic Broadcast)** protocol, a Paxos-flavored consensus algorithm. Latency is the cost; correctness is the product.
+
+### Why coordination is its own category
+
+The first instinct of every engineer encountering ZooKeeper is "why don't I just use Postgres / Redis / a key-value store for this?" The answer lives in the failure modes:
+
+| Problem | Naive solution | Why it fails |
+|---|---|---|
+| **Leader election** across 10 service instances | "Whoever inserts a row first wins" in Postgres | Network partition: two leaders elected, both think they won, split-brain |
+| **Distributed lock** for a critical section | `SET NX` in Redis | Redlock debate; clock skew + GC pauses cause double-ownership |
+| **Cluster membership** (who is alive?) | Heartbeat table in MySQL | Race conditions on join/leave; stale entries; thundering herd on changes |
+| **Configuration that must update atomically across nodes** | Push from a script | Some nodes get old config, some get new; no ordering guarantee |
+| **Notification when shared state changes** | Polling | Latency vs load trade-off; never converges nicely |
+
+ZooKeeper exists because **getting these primitives right requires consensus, and consensus is hard.** Building "leader election in Postgres" once is a bug; building it correctly is a research project. ZooKeeper does it correctly so you don't have to.
+
+### Watches and ephemerals (the magic ingredients)
+
+Two features make ZooKeeper uniquely suited to coordination:
+
+```text
+EPHEMERAL ZNODES                          WATCHES
+─────────────────                         ───────
+
+  client A creates                          client A reads /config
+  /workers/A (ephemeral)                    AND sets a watch
+        │                                         │
+        │ session alive                           │ value is "v1"
+        ▼                                         ▼
+   znode exists                              waiting...
+        │                                         │
+        │ client A crashes / network drops        │ client B writes "v2"
+        ▼                                         ▼
+   session expires                           ZK fires watch event
+        │                                    to client A
+        ▼                                         │
+   znode auto-deleted                             ▼
+                                            client A re-reads → "v2"
+
+  → "alive members" = list znodes under     → no polling, no missed updates
+    /workers (auto-cleaned on death)        → watches are one-shot, must
+                                              re-register after firing
+```
+
+Ephemerals turn liveness into a primitive. Watches turn change notification into a primitive. Together they make leader election, cluster membership, and config distribution into a few dozen lines of code instead of a research paper.
+
+### Sweet spot
+- **Leader election** in distributed systems that need a single coordinator (e.g., Kafka controller historically, HBase HMaster, Solr Cloud overseer).
+- **Cluster membership** with automatic failure detection via ephemeral znodes.
+- **Distributed configuration** that must update atomically across all nodes, with notifications.
+- **Distributed locks with fencing tokens** — ZooKeeper's `zxid` (transaction id) is monotonically increasing and can be used as a fencing token, the property that makes a lock actually safe under failures.
+- **Service discovery** in pre-Kubernetes architectures (Twitter Finagle's ServerSet, Hadoop's HA, etc.).
+- **Sequencer / counter** for globally-ordered IDs across a cluster.
+- **As a dependency of other systems** that picked it: Kafka (until KRaft), HBase, HDFS HA, Solr Cloud, Mesos, Druid, Pinot.
+
+### Don't use it for
+- **General-purpose key-value storage.** Znode size limit is 1 MB, recommended <few KB. Total dataset should fit comfortably in memory across the ensemble. Storing user data here is malpractice.
+- **High write throughput.** Every write is a Paxos round across the ensemble. ~10K writes/sec is a reasonable upper bound; exceed it and consensus latency dominates.
+- **High read throughput from a single znode.** Reads are local to each follower, so reads scale with ensemble size, but a single hot znode with thousands of watchers triggers **watch storms** on every change.
+- **As a database.** No queries beyond path lookup. No secondary indexes. No transactions across paths. No JOIN. The wrong tool for almost any data problem.
+- **Storing data that doesn't need consensus.** If "eventually consistent" is acceptable, use Redis or Cassandra. ZooKeeper is paying for consistency you don't need.
+- **New greenfield systems in 2026.** Increasingly, **etcd** is the better choice — gRPC API, simpler operations, kubernetes-native, no JVM. ZooKeeper persists in legacy ecosystems (Kafka pre-KRaft, Hadoop) but is rarely the first pick for a new design.
+
+### How it breaks at scale
+
+```text
+   ensemble:     3 nodes       5 nodes       7 nodes       9+ nodes
+                  │             │             │             │
+   throughput: ┌──┴──┐       ┌──┴──┐       ┌──┴──┐       ┌──┴──┐
+               │ Best│       │Good │       │ Slow│       │BAD  │
+               │write│       │write│       │write│       │write
+               │perf │       │perf │       │perf │       │perf │
+               └─────┘       └──────┘      └──────┘      └─────┘
+   tolerates:    1 fail        2 fail        3 fail        4 fail
+
+   counter-intuitive truth: more nodes does NOT mean more throughput.
+   it means more durability and more consensus latency. 5 is the
+   default sweet spot; 3 for small, 7 only if 2-failure tolerance
+   isn't enough.
+```
+
+1. **Ensemble sizing surprise.** New users assume "more nodes = more capacity." Wrong. Every write must be acknowledged by a majority. A 9-node ensemble needs 5 acks; a 3-node ensemble needs 2. Larger ensembles are *slower for writes*, more durable, and harder to operate. **Default to 5; drop to 3 only for dev; never exceed 7 without a specific reason.**
+
+2. **JVM GC pauses.** ZooKeeper is written in Java. A long GC pause on the leader looks like a network partition to followers, triggers a leader election, and stalls every client during the ~few seconds it takes. Tuning the JVM (G1GC, heap sizing) is non-negotiable for production ZK.
+
+3. **Snapshot and transaction log bloat.** ZK persists state via periodic snapshots and a transaction log between snapshots. Without housekeeping (`autopurge.snapRetainCount`, `autopurge.purgeInterval`), disks fill and recovery slows. A ZK with millions of znodes can take many minutes to recover after a crash.
+
+4. **Watch storms.** A znode with 10,000 watchers receives a write; ZK must notify all 10,000 clients. The notification fanout pins network and CPU. **Pattern: structure data so watches are on parent znodes (children-changed) with a small fanout, not on individual children.**
+
+5. **Multi-DC deployments.** ZAB consensus crosses the WAN; latency makes writes painfully slow. **Standard advice: do not stretch ZK across data centers.** Run a per-DC ensemble and replicate at the application layer if needed.
+
+6. **Session expiry under load.** Clients keep their session alive with heartbeats. Under network or GC stress, heartbeats are missed, sessions expire, ephemeral znodes vanish, leadership is reassigned, and a brief blip becomes a leadership churn event. This is the **classic Kafka-controller-flapping incident**: a slow ZK GC takes the Kafka cluster offline for minutes.
+
+### What seniors watch for
+- **ZK used as application storage.** Anything beyond coordination metadata is a smell. Read znode counts and sizes; if they trend up, intervene.
+- **Single, oversized ensemble shared by every system in the org.** A misbehaving client takes everyone down. Pattern: per-system ensembles, sized small.
+- **No backup / recovery drill.** ZK can lose state on cascading failures. Snapshots + transaction logs must be backed up; restore must be tested.
+- **Clients with no exponential backoff on session expiry.** Reconnect storms after a brief ZK outage cause a second outage.
+- **Watches re-registered incorrectly** (they are one-shot — fire-once, then must be re-set). Buggy clients miss updates silently.
+- **Choosing ZK in 2026 for a greenfield system.** Defensible only when integrating with an ecosystem that already requires it. Otherwise, evaluate etcd or Consul first.
+- **Using ZK as a service discovery layer** in a Kubernetes environment. Kubernetes already does this with etcd. Stacking ZK on top is duplication.
+
+### Cost & ops burden
+
+| Flavor | Cost (relative) | Ops burden | When it's the right answer |
+|---|---|---|---|
+| **Self-managed Apache ZooKeeper** | 1× | High — JVM tuning, ensemble ops, snapshot management | Required by your stack (Kafka pre-KRaft, HBase, Solr) |
+| **ClickHouse Keeper** | 0× extra | Low — embedded in ClickHouse, drop-in ZK protocol replacement | Running ClickHouse at scale; replaces external ZK |
+| **etcd (alternative)** | 1× | Low–medium — Go binary, simpler than ZK, gRPC API | New systems needing coordination; Kubernetes-native shops |
+| **HashiCorp Consul (alternative)** | 1× | Medium — adds service discovery, KV, mesh; more features | Want coordination + service discovery + multi-DC in one tool |
+
+The honest summary: **nobody starts a new project with ZooKeeper in 2026.** It is the coordination layer of an earlier generation of distributed systems and persists where those systems live. The strategic move is **understanding ZooKeeper deeply because the systems on top of it (Kafka, HBase, Solr) are deeply shaped by it**, then defaulting to **etcd** for new coordination needs.
+
+### War stories
+- **Yahoo! — birthplace (2008).** Built ZooKeeper to replace a tangle of one-off coordination code across Hadoop and other distributed systems. The original paper *"ZooKeeper: Wait-free coordination for Internet-scale systems"* is short and worth reading. Lesson: **coordination is a horizontal concern; extracting it into one well-tested service prevents every team from re-implementing leader election badly.**
+- **Apache Kafka — 12-year ZK dependency, then KIP-500 (2019–2024).** Kafka used ZK from inception until the KRaft migration. The fact that removing ZK was a five-year project across multiple major releases tells you how deeply coordination weaves into a system's architecture. Lesson: **picking a coordination service is a decade-long commitment. Choose with that horizon in mind.**
+- **Hadoop / HBase / HDFS HA.** The entire Hadoop ecosystem leans on ZK for HA, leader election, and cluster state. Public docs and incident reports across Cloudera, Hortonworks, MapR all share the same ZK operational lessons. Lesson: **ZK is the unsung Tier-0 service in many data platforms; treat it as such operationally.**
+- **Twitter — Finagle's ServerSet.** Built service discovery on ZooKeeper across thousands of services pre-Kubernetes. Public posts describe scale challenges and the eventual move toward more specialized infrastructure. Lesson: **service discovery on ZK works at scale but is not its sweet spot; modern environments (Kubernetes, Consul) handle it better.**
+- **Pinterest — running ZooKeeper for the Kafka fleet.** Public posts describe operational practices for ZK ensembles supporting massive Kafka deployments, including the playbook for ZK incidents that cascade into Kafka outages. Lesson: **the most common Kafka outage in the ZK era was not a Kafka bug — it was a ZK GC pause.**
+- **Kubernetes choosing etcd over ZooKeeper (2014).** When Google built Kubernetes, they explicitly chose etcd over ZooKeeper for the cluster state store, citing simpler operations, gRPC, and a smaller surface area. Lesson: **the industry's most consequential vote against ZK for new systems came from the people who knew distributed coordination best.**
+- **The cautionary tale — every Kafka cluster, once.** A long ZK GC pause triggers a Kafka controller failover; partition leadership reshuffles; producers see retriable errors; downstream systems back up. The ZK pause was 4 seconds; the Kafka recovery took 20 minutes. There is no famous post-mortem because every team has lived this story. The lesson: **monitor ZK GC pauses as a Kafka health metric, not just a ZK health metric.**
 
 ---
 
