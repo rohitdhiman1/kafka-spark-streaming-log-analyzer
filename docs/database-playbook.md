@@ -271,4 +271,141 @@ The honest summary: **ClickHouse is the price-performance leader for analytical 
 
 ---
 
-*Next up: Cassandra. Same template, same visual density. Tell me to continue or adjust first.*
+---
+
+<a id="redis"></a>
+## Redis
+
+### Identity
+A single-threaded, in-memory **data structure server** that happens to be the world's most popular cache. The "key-value store" label is the single biggest misnomer in databases — Redis ships strings, hashes, lists, sets, sorted sets, bitmaps, hyperloglogs, streams, and geospatial indexes, all addressable by key, all manipulated atomically. The cache is the appetizer; the data structures are the meal.
+
+### Mental model
+A **giant chalkboard with a single, very fast scribe**. Every command is one operation by one hand. Because there is exactly one scribe, every command is atomic — no locks needed, no race conditions inside a command. The chalkboard lives in RAM, so reads and writes are nanoseconds. The same property is also the ceiling: one scribe means one CPU core's worth of work per shard, no matter how big the machine.
+
+### What Redis actually offers (the cheat sheet most engineers skip)
+
+| Data structure | Killer use case | Common command |
+|---|---|---|
+| **String** | Cache values, counters, feature flags | `GET`, `SET`, `INCR` |
+| **Hash** | Session objects, sparse user records | `HGET`, `HSET`, `HINCRBY` |
+| **List** | Job queues (small scale), recent-items feeds | `LPUSH`, `RPOP`, `BRPOP` |
+| **Set** | Tags, unique visitor tracking, set algebra | `SADD`, `SINTER`, `SISMEMBER` |
+| **Sorted set (ZSET)** | **Leaderboards, time-series, priority queues, rate limiting** | `ZADD`, `ZRANGEBYSCORE` |
+| **Bitmap** | Active-user bitmasks, A/B test buckets | `SETBIT`, `BITCOUNT` |
+| **HyperLogLog** | Cardinality estimation (unique counts) at tiny memory cost | `PFADD`, `PFCOUNT` |
+| **Stream** | Append-only log, lightweight Kafka-alike | `XADD`, `XREADGROUP` |
+| **Geo** | "Find pubs within 2 km" | `GEOADD`, `GEOSEARCH` |
+| **Pub/Sub** | Fire-and-forget broadcast | `PUBLISH`, `SUBSCRIBE` |
+
+The sorted set alone is responsible for half the senior-engineer "Redis is magic" reactions. A leaderboard with rank, range, and score queries in O(log N) is one line of code.
+
+### Sweet spot
+- **Caching.** The 80% case. Cache-aside pattern, TTLs everywhere, hit ratio in the high 90s.
+- **Session stores.** Hash per session, TTL aligned with session lifetime. Stateless app servers, horizontal scale, no sticky sessions needed.
+- **Rate limiting.** `INCR` + `EXPIRE`, or sorted-set sliding windows. The standard pattern at every API gateway.
+- **Leaderboards and ranked feeds.** Sorted sets are unbeatable. Twitter timelines, gaming leaderboards, "top stories" widgets.
+- **Distributed locks** *(with care — see anti-patterns)*. Short-lived mutual exclusion across processes.
+- **Real-time counters and metrics** that don't need durability — page views, active users, "X people are looking at this hotel right now."
+- **Pub/Sub for fire-and-forget broadcasts** at modest scale.
+- **Streams for lightweight queueing** when Kafka is overkill but in-memory queues aren't enough.
+
+### Cache-aside pattern (the canonical Redis architecture)
+
+```text
+   ┌─────────┐    1. GET key             ┌─────────┐
+   │   App   │ ───────────────────────▶  │  Redis  │
+   │         │ ◀───── HIT (value) ──────  │  cache  │
+   └────┬────┘                           └─────────┘
+        │ MISS
+        ▼
+   ┌─────────┐    2. SELECT ...          ┌─────────┐
+   │ Postgres│ ◀───────────────────────  │   App   │
+   │  (truth)│ ───── row ──────────────▶ │         │
+   └─────────┘                           └────┬────┘
+                                              │
+                                              │ 3. SET key value EX 300
+                                              ▼
+                                         ┌─────────┐
+                                         │  Redis  │
+                                         └─────────┘
+```
+
+Three rules nobody writes down but everyone learns the hard way:
+1. **TTL everything.** A cache without expiry is a memory leak with extra steps.
+2. **Cache the result, not the query.** Cache by canonical key, not by user input string.
+3. **Invalidate on write, not on read.** And accept that cache invalidation is, as Phil Karlton said, one of the two hard problems in computer science.
+
+### Don't use it for
+- **Source of truth.** Redis is RAM. Persistence (RDB snapshots, AOF log) exists, but the design center is "if I lost everything, the system would heal." Treat it as accelerator, not vault.
+- **Datasets bigger than RAM.** Redis on Flash and Redis Enterprise tiered storage exist but blunt the speed advantage. If your working set won't fit in memory across a reasonable cluster, use a different tool.
+- **Complex queries, joins, secondary indexes.** Not a database in that sense. RediSearch module adds some of this, but if you need real query capability, reach for Postgres.
+- **Durable queues at scale.** Lists and Streams work, but losing messages on failover is a real risk. SQS, Kafka, and RabbitMQ exist for a reason.
+- **Pub/Sub for anything that must not be lost.** It is fire-and-forget — subscribers offline at publish time miss the message forever. (Streams give you durability; classic pub/sub does not.)
+- **Cross-key transactions you actually trust.** `MULTI/EXEC` is atomic on a single shard but provides no isolation across shards in Redis Cluster.
+- **Big values.** A 100 MB string blocks the single thread for tens of milliseconds. Tail latency dies. Keep values under ~100 KB.
+
+### How it breaks at scale
+
+```text
+   scale →   1 GB RAM     10 GB RAM    100 GB+      multi-node     multi-region
+              │             │             │             │             │
+  cliff:   ┌──┴──┐       ┌──┴──┐       ┌──┴──┐       ┌──┴──┐       ┌──┴──┐
+           │ Hot │       │ Big │       │Single│      │Cluster│     │Cross-│
+           │ key │       │ key │       │thread│      │ resh-│      │region│
+           │      │      │block │      │ceiling│     │arding│      │ async│
+           └─────┘       └──────┘      └──────┘      └──────┘      └─────┘
+   fix:  Local cache    Chunk values  Shard via     Plan slot     Region-
+         (L1) +         or move to    Cluster;      moves         local;
+         hash-tag       Postgres      add KeyDB/    carefully;    accept
+         distribution                 Dragonfly     downtime      eventual
+                                      for multi-                  per region
+                                      core
+```
+
+1. **The hot key (the first cliff, hits early).** A single key getting 100K req/s pins one core on one node. The rest of the cluster sits idle while one shard melts. **Fix: read replicas with `READONLY` mode, an L1 in-process cache in front, or hash-tag distribution to spread the load across multiple keys.** The hot-key problem is the most common Redis production incident.
+
+2. **Big-value blocking.** Single-threaded means one slow command stalls everything. `KEYS *` on a million-key DB. `SMEMBERS` on a million-member set. A 50 MB `GET`. Tail latency goes from 1 ms to 5 seconds. **Fix: `SCAN` instead of `KEYS`, `SSCAN` instead of `SMEMBERS`, value size limits enforced in code, `SLOWLOG` monitored.**
+
+3. **The single-thread ceiling.** One Redis process uses one core. At ~100K ops/sec per shard you are done. **Fix: Redis Cluster (16384 hash slots distributed across nodes), or alternatives like KeyDB / Dragonfly that are multi-threaded and Redis-protocol-compatible.** Dragonfly in particular is gaining traction for being 25× more memory-efficient on the same hardware.
+
+4. **Cluster resharding pain.** Adding or removing nodes requires moving slots, which moves keys, which is slow and error-prone under load. Most teams over-provision Cluster from day one to avoid resharding parties.
+
+5. **Persistence trade-off surprises.** RDB snapshots fork the process — at 100 GB RAM that fork is slow and memory-spikes the host. AOF fsync-every-write halves throughput. Most teams pick AOF + `everysec` and accept up to 1 second of data loss on hard crash. Defaults are not sane.
+
+6. **The Redlock debate.** Antirez (Redis creator) published the Redlock algorithm for distributed locks; Martin Kleppmann published a famous critique arguing it is fundamentally unsafe under realistic failure modes. The honest engineering answer: **if correctness depends on the lock, do not use Redis locks. Use ZooKeeper, etcd, or a database with real fencing tokens.** Redis locks are fine for "best effort, prevent thundering herd" — not for "must not double-charge a credit card."
+
+### What seniors watch for
+- **`KEYS *` in production code.** Career-limiting move. Always use `SCAN`.
+- **Caches without TTLs.** Eviction policy (`maxmemory-policy`) becomes the only thing standing between you and OOM.
+- **No `SLOWLOG` monitoring.** A single 200 ms command tells you something is wrong; without monitoring it, you'll never know.
+- **Lua scripts that loop over many keys.** Atomic, yes — and atomically blocking. Long Lua scripts are a stealthy way to create a hot key.
+- **Using Redis as the only place a piece of data lives.** Even with persistence, you should be able to rebuild the cache. If you can't, you've made it a database.
+- **Distributed locks for correctness-critical operations.** See Redlock debate above.
+- **Pub/Sub used as a message queue.** Subscribers offline = messages gone. Use Streams or a real broker.
+- **Storing large blobs** (images, files, big JSON). Object storage costs less and doesn't block the event loop.
+- **`MGET` of thousands of keys in one round-trip.** Atomic and convenient — also blocks the thread for the duration.
+- **Keys without consistent naming convention.** `user:123:session` vs `session_user_123` — sounds petty, becomes painful at scale when you need to debug, scan, or migrate.
+
+### Cost & ops burden
+
+| Flavor | Cost (relative) | Ops burden | When it's the right answer |
+|---|---|---|---|
+| **Self-managed OSS** | 1× | Medium — Sentinel/Cluster setup, persistence tuning, version upgrades | Have ops muscle; cost-sensitive |
+| **AWS ElastiCache (Redis)** | 2–3× | Low — managed failover, backups, patching | Default for AWS shops under significant scale |
+| **AWS MemoryDB** | 4–6× | Low — multi-AZ durable Redis with strong consistency | Need Redis API + durability as primary store (rare; usually a smell) |
+| **Redis Enterprise / Redis Cloud** | 3–6× | Low — adds active-active geo, modules (Search, JSON, TimeSeries, Bloom) | Need modules or active-active across regions |
+| **KeyDB / Dragonfly (alternatives)** | 1× infra; new ops | Medium — newer, smaller community | Single-shard hitting CPU ceiling, want multi-threading without sharding |
+
+The honest summary: **the engine is free; the operations and the RAM are not.** Memory is the dominant cost — a 100 GB Redis cluster on AWS runs five figures per month before you blink. Senior teams are ruthless about TTLs and value sizes for exactly this reason.
+
+### War stories
+- **Twitter — timeline fan-out (2010s).** Pioneered the "Redis lists per user" pattern for celebrity tweets — push the tweet ID into millions of follower timelines at write time, read O(1) at scroll time. Public talks describe the architecture. Lesson: **Redis turned a read-heavy, query-heavy problem into a precomputed-write problem. The data structure was the design.**
+- **Stack Overflow — radically minimal infra.** Famously runs the world's most-trafficked Q&A site on a tiny number of servers, with Redis as the central cache. Public posts (Nick Craver's "Stack Overflow: How We Do Deployment / How We Do Caching") show how aggressive caching + good schema beats microservices. Lesson: **Redis-in-front-of-Postgres scales further than most teams imagine before they "need" anything fancier.**
+- **GitHub — Sidekiq + Redis for job processing.** Background jobs for billions of webhook deliveries, notifications, and async work run through Redis-backed Sidekiq queues. Public engineering posts discuss the scale and the failure modes. Lesson: **Redis is a fine queue at GitHub's scale, but only because they treat it as ephemeral and design jobs to be retryable.**
+- **Discord — early stack heavy on Redis** for presence, sessions, ephemeral state. Their later move to Cassandra/Scylla for messages is well-documented; Redis stayed for what it was good at. Lesson: **right tool per workload — message storage and presence have different shapes.**
+- **Shopify — Black Friday rate limiting and inventory.** Public posts describe Redis as the rate-limiter and short-term inventory cache backing the world's largest single-day e-commerce events. Lesson: **at peak load, the cache is not optional, it is the system.**
+- **The cautionary tale — Robinhood (2020 outage).** A cascading failure that included Redis hot-key issues during the GameStop trading frenzy. Public reporting points to systems unable to handle the surge, with caching layers contributing. Lesson: **load tests with realistic key-distribution skew; uniform synthetic load hides hot keys.**
+
+---
+
+*Next up: Prometheus.*
