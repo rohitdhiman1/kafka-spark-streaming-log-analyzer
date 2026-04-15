@@ -33,6 +33,7 @@ docker compose up --build
 This starts:
 - Zookeeper
 - Kafka broker (`localhost:9092` from host, `broker:29092` inside Docker network)
+- Kafdrop UI (`http://localhost:9000`) — browse topics, partitions, and messages
 - Spark master (`http://localhost:8080`)
 - Spark worker
 - Python log producer (writes to `web-logs`)
@@ -59,6 +60,39 @@ docker compose logs -f producer
 
 ```bash
 docker compose down -v
+```
+
+## Architecture diagram
+
+```text
+                 ┌──────────────┐
+                 │  Zookeeper   │
+                 │    :2181     │
+                 └──────┬───────┘
+                        │
+                        ▼
+┌──────────────┐   ┌──────────────┐        ┌──────────────┐
+│   Producer   │──▶│    Kafka     │───────▶│   spark-job  │
+│   (Python)   │   │  web-logs    │  read  │  (Structured │
+│ ~5-10 ev/sec │   │   :29092     │ Stream │   Streaming) │
+└──────────────┘   └──────────────┘        └──────┬───────┘
+                                                  │ spark-submit
+                                                  ▼
+                                        ┌──────────────────┐
+                                        │   spark-master   │
+                                        │  :7077, UI :8080 │
+                                        └────────┬─────────┘
+                                                 │
+                                                 ▼
+                                        ┌──────────────────┐
+                                        │   spark-worker   │
+                                        │     UI :8081     │
+                                        └──────────────────┘
+
+   Streaming queries (output to console / docker logs):
+     1. Error rate per 1-minute window
+     2. Top 5 endpoints + avg response time
+     3. Slow requests (> SLOW_REQUEST_THRESHOLD_MS)
 ```
 
 ## Architecture summary

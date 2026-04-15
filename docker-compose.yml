@@ -38,8 +38,22 @@ services:
     networks:
       - log-analyzer-net
 
+  kafdrop:
+    image: obsidiandynamics/kafdrop:4.0.1
+    container_name: kafdrop
+    depends_on:
+      broker:
+        condition: service_healthy
+    ports:
+      - "9000:9000"
+    environment:
+      KAFKA_BROKERCONNECT: broker:29092
+      JVM_OPTS: "-Xms64M -Xmx128M"
+    networks:
+      - log-analyzer-net
+
   spark-master:
-    image: bitnami/spark:3.5
+    image: bitnamilegacy/spark:3.5
     container_name: spark-master
     environment:
       SPARK_MODE: master
@@ -58,7 +72,7 @@ services:
       - log-analyzer-net
 
   spark-worker:
-    image: bitnami/spark:3.5
+    image: bitnamilegacy/spark:3.5
     container_name: spark-worker
     depends_on:
       spark-master:
