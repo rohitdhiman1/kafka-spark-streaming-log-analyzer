@@ -33,9 +33,9 @@ A scenarios chapter at the end works the other direction: starting from the **pr
 4. [Redis](#redis)
 5. [Prometheus](#prometheus)
 6. [Kafka](#kafka)
-7. ZooKeeper *(coming next)*
-8. Apache Iceberg
-9. Elasticsearch
+7. [ZooKeeper](#zookeeper)
+8. [Apache Iceberg](#iceberg)
+9. [Elasticsearch](#elasticsearch)
 10. Cassandra
 11. Scenarios — payments, e-commerce, Black Friday, search, observability, data lake, leaderboards, fraud, recommendations, multi-tenant SaaS
 12. Decision flowchart
@@ -823,4 +823,343 @@ The honest summary: **nobody starts a new project with ZooKeeper in 2026.** It i
 
 ---
 
-*Next up: Apache Iceberg.*
+---
+
+<a id="iceberg"></a>
+## Apache Iceberg
+
+### Identity
+An **open table format** for petabyte-scale analytic datasets on object storage. Not a database, not a query engine, not a storage system — a **specification** for how to lay out Parquet files plus metadata so that any engine (Spark, Trino, Snowflake, BigQuery, DuckDB, ClickHouse) can read and write the same table with ACID guarantees, schema evolution, and time travel. Born at Netflix (2017) to fix the operational nightmare that was the Hive table format, donated to Apache, now the de facto standard of the modern lakehouse.
+
+### Mental model
+**Git for big tables on S3.** A folder of Parquet files in object storage by itself is just a folder — no atomicity, no schema evolution, no concurrent-write safety. Iceberg adds a layer of metadata files that turn that folder into a **real table with commits, branches, snapshots, and history**. Every change creates a new snapshot pointed to by a metadata file; the catalog atomically swaps the pointer; readers always see a consistent table state. Old snapshots stick around until you expire them, giving you free time travel.
+
+### Why a "table format" is its own category
+
+Engineers coming from databases find Iceberg's existence confusing. The clearest framing:
+
+| Layer | Role | Examples |
+|---|---|---|
+| **Storage** | Where bytes live | S3, GCS, ADLS, MinIO, HDFS |
+| **File format** | How a single file is structured | Parquet, ORC, Avro |
+| **Table format** | How many files behave as one table | **Iceberg, Delta Lake, Apache Hudi** |
+| **Catalog** | Where the "current pointer" for each table is stored | REST, Glue, Nessie, Polaris, Hive Metastore, Unity |
+| **Engine** | What reads/writes the table | Spark, Trino, Flink, Snowflake, BigQuery, DuckDB, ClickHouse |
+
+Before table formats, a "table" in a data lake was *"this folder, by convention"* — the Hive way. Adding a column meant rewriting partitions. Concurrent writes corrupted state. There were no transactions. Iceberg, Delta, and Hudi all emerged 2017–2018 to solve this same set of problems, with slightly different designs and now overlapping ecosystems.
+
+### How Iceberg actually works (the metadata stack)
+
+The single most important diagram for understanding Iceberg. Internalize this and the rest of the system makes sense.
+
+```text
+                              ┌─────────────────┐
+                              │     CATALOG     │  ← atomic pointer swap on commit
+                              │ (REST/Glue/etc) │     (this is the consistency primitive)
+                              └────────┬────────┘
+                                       │ "current metadata.json for table T is..."
+                                       ▼
+                          ┌────────────────────────┐
+                          │    metadata.json       │  ← snapshot history, schema,
+                          │  (one per table state) │     partition spec, properties
+                          └────────────┬───────────┘
+                                       │ points to
+                                       ▼
+                          ┌────────────────────────┐
+                          │   manifest list (avro) │  ← which manifests are in
+                          │   = one snapshot       │     this snapshot
+                          └────────────┬───────────┘
+                                       │ points to many
+                          ┌────────────┼────────────┐
+                          ▼            ▼            ▼
+                    ┌──────────┐ ┌──────────┐ ┌──────────┐
+                    │ manifest │ │ manifest │ │ manifest │  ← per-file stats
+                    │  (avro)  │ │  (avro)  │ │  (avro)  │     (min/max/null counts)
+                    └────┬─────┘ └────┬─────┘ └────┬─────┘
+                         │            │            │
+                  ┌──────┴──────┐  ...  ...
+                  ▼      ▼      ▼
+             ┌───────┐ ┌───────┐ ┌───────┐
+             │parquet│ │parquet│ │parquet│  ← actual data files
+             │ file  │ │ file  │ │ file  │     (immutable, append-only at this layer)
+             └───────┘ └───────┘ └───────┘
+```
+
+Implications worth burning in:
+- **Commits are O(1) at the catalog.** Whether you wrote 10 files or 10,000, the commit is one atomic pointer swap. This is the durability primitive.
+- **Reads use the metadata to skip whole files.** Per-file min/max stats let the engine prune files without reading them. This is why Iceberg queries can be fast over petabytes.
+- **Snapshots are free until you expire them.** Each commit creates a new snapshot; old ones share data files. Time travel costs metadata storage, not data storage.
+- **The catalog choice is consequential.** It is the consistency boundary. Glue, Nessie, Polaris, REST catalog, Hive Metastore — each has different operational and feature trade-offs. Pick deliberately.
+
+### Hidden partitioning (the killer feature)
+
+In Hive, partitioning was a physical layout concern that leaked into every query: forget to filter on the partition column and you scanned the whole table. Iceberg decouples logical and physical:
+
+```text
+HIVE                                      ICEBERG
+────                                      ───────
+
+CREATE TABLE events (                     CREATE TABLE events (
+  ts TIMESTAMP,                             ts TIMESTAMP,
+  user_id BIGINT,                           user_id BIGINT,
+  ...                                       ...
+)                                         ) USING iceberg
+PARTITIONED BY (                          PARTITIONED BY (
+  dt STRING  ← physical partition           days(ts)   ← derived from ts
+)                                         )
+
+writer must compute dt and write          writer just writes ts
+SELECT must filter on dt or               SELECT WHERE ts > '...'
+scan everything:                          automatically prunes:
+                                          → engine reads partition spec
+WHERE dt = '2025-04-15'  ✓ fast           → derives partition from ts
+WHERE ts > '2025-04-15'  ✗ full scan      → prunes files
+
+partition is part of the schema           partition is metadata; can change
+forever; can't change without             without rewriting data
+rewriting everything                      (partition evolution)
+```
+
+This is why Netflix built Iceberg in the first place: **the Hive partitioning model cost them years of pain, and "WHERE on the wrong column" full-scans were a recurring outage cause.**
+
+### Sweet spot
+- **Lakehouse architecture.** One copy of data in object storage, read by Spark for ETL, Trino for ad-hoc, DuckDB on the analyst's laptop, Snowflake for BI. No copies, no sync, no vendor lock-in.
+- **Long-term raw event archive.** Years of logs, clickstream, telemetry — Iceberg + Parquet + S3 is the cheapest durable analytical storage available.
+- **Slowly-changing dimensional data** with the need for time-travel queries: "what did this customer's profile look like on Jan 1?"
+- **Reprocessing and backfills.** Bug in your aggregation job? Replay from Iceberg, write to a new snapshot, atomic cutover. No lost data.
+- **Compliance and audit.** Snapshots give you an auditable history. GDPR delete-by-key is supported via copy-on-write or merge-on-read.
+- **Multi-engine futures.** You don't know what query engine you'll want in 5 years. Iceberg lets you change engines without migrating data.
+
+### Don't use it for
+- **OLTP.** Not a database. No row-level locking, no point lookups, no transactions across tables in the OLTP sense.
+- **Sub-second queries on small data.** Overhead of metadata parsing dominates for tiny tables. Postgres or DuckDB beats Iceberg under ~1 GB.
+- **Streaming source of truth.** Iceberg supports streaming writes (Flink, Spark Structured Streaming) but the **commit cadence trade-off** is real — too frequent and metadata explodes; too infrequent and freshness suffers. Kafka stays the source-of-truth log; Iceberg is the analytical projection.
+- **Frequent row-level mutations.** Updates and deletes are supported via copy-on-write (rewrite affected files) or merge-on-read (write delete files, reconcile at read). Both work; both are expensive at high mutation rates. If you need many updates per second, you have picked the wrong layer.
+- **Replacing your transactional database.** Iceberg sits *downstream* of OLTP, not in place of it.
+- **High-concurrency dashboards on raw tables.** Use ClickHouse or a query engine cache layer. Iceberg shines on ad-hoc and batch, not on thousand-QPS dashboards.
+
+### How it breaks at scale
+
+```text
+   scale →   1 TB         100 TB        1 PB          10 PB+        multi-region
+              │             │             │             │             │
+  cliff:   ┌──┴──┐       ┌──┴──┐       ┌──┴──┐       ┌──┴──┐       ┌──┴──┐
+           │Small│       │Snapsht│     │Mani- │      │Concurr│     │Catalog│
+           │file │       │ bloat │     │fest  │      │write  │     │ +     │
+           │probl│       │       │     │bloat │      │conflct│     │locality│
+           │em   │       │       │     │      │      │       │     │       │
+           └─────┘       └──────┘      └──────┘      └──────┘      └──────┘
+   fix:  rewrite_data_  expire_       partial         retry +      Per-region
+         files (compact) snapshots    manifest        partitioned  catalogs;
+         + adaptive     + remove_orph compaction      writes;      cross-region
+         streaming      an_files                      Nessie       reads via
+         batching                                     branching    object store
+                                                                   replication
+```
+
+1. **The small file problem (the first cliff, hits early).** Streaming writes commit small batches → many small Parquet files. Reading 10,000 small files is dramatically slower than reading 100 large ones. **Fix is mandatory: scheduled compaction (`rewrite_data_files`), target file size 128–512 MB. Treat this like vacuum in Postgres — not optional, just maintenance.**
+
+2. **Snapshot bloat.** Every commit is a snapshot. Without expiration, snapshot history grows forever, and so does the metadata. **Fix: `expire_snapshots` policy (typically retain 7–30 days), `remove_orphan_files` periodically. Most teams set this up too late.**
+
+3. **Manifest bloat.** Within a snapshot, manifests can become thousands of files. Query planning slows because the engine reads every manifest. **Fix: `rewrite_manifests` to consolidate. Newer Iceberg versions handle this better; still requires monitoring.**
+
+4. **Concurrent write conflicts.** Iceberg uses optimistic concurrency at the catalog. Two writers committing to the same table at the same time → one wins, the other retries (or fails). High write concurrency requires partitioned writes (each writer owns a partition) or branching strategies (Nessie).
+
+5. **Catalog as the bottleneck.** All commits funnel through the catalog. Hive Metastore can struggle at high commit rates; REST catalog and Polaris/Nessie are the modern answer. **Catalog choice is one of the most consequential operational decisions.**
+
+6. **Cross-region cost.** S3 cross-region reads are expensive. Iceberg metadata is small but data is not. Most large deployments run **per-region tables with replication**, not single global tables.
+
+### What seniors watch for
+- **No compaction strategy in place from day one.** A streaming pipeline writing to Iceberg without compaction is a time bomb. Set it up before turning on the firehose.
+- **Snapshot expiration disabled or absent.** "We might want to time-travel back to last year" sounds nice; storage cost and metadata performance say otherwise. Pick a retention window and enforce it.
+- **Catalog choice made by accident** (whatever the first tutorial used). Glue is fine for AWS-only shops; Nessie for Git-like branching workflows; Polaris for Snowflake interop; REST catalog as the open standard. Choose with intent.
+- **Partition spec chosen casually.** Over-partitioning (one file per partition) creates the small-file problem instantly. Under-partitioning makes pruning useless. Common pattern: `days(ts)` or `bucket(N, key)`, not raw high-cardinality columns.
+- **Multi-engine claims untested.** "Iceberg works with everything" is true *in principle*. In practice, write support, advanced features, and version compatibility vary. Test the engines you actually use before committing.
+- **Format-war ignorance.** Iceberg vs Delta vs Hudi is a real strategic decision in 2026. Understand the trade-offs and the political landscape (see war stories below).
+- **Treating Iceberg as a streaming sink without thinking through commit cadence.** Every commit is a snapshot; commit every 10 seconds and you have 8,640 snapshots per day. Batch writes; commit per minute or per partition.
+- **Forgetting that schema evolution has limits.** Iceberg handles add/drop/rename columns gracefully; it does **not** automatically migrate semantically incompatible changes. Rename a column from `total_cents` (BIGINT) to `total` (DOUBLE) without thinking → silent corruption.
+
+### Iceberg vs Delta vs Hudi (the format wars in one table)
+
+| Dimension | Iceberg | Delta Lake | Hudi |
+|---|---|---|---|
+| **Origin** | Netflix (2017), Apache | Databricks (2017), Linux Foundation | Uber (2017), Apache |
+| **Engine neutrality** | Strongest — true multi-engine spec | Historically Databricks-centric, opening up | Spark-centric, expanding |
+| **Streaming writes** | Good (Flink, Spark) | Good (Spark Structured Streaming) | **Strongest — designed for it** |
+| **Updates/deletes** | Copy-on-write or merge-on-read | Copy-on-write or merge-on-read | Copy-on-write or merge-on-read |
+| **Catalog options** | Many (REST, Glue, Nessie, Polaris, Hive) | Unity Catalog (Databricks-led), others emerging | Hive Metastore primarily |
+| **Industry momentum (2024–2026)** | **Winning the open standard war** | Strong; merging with Iceberg via UniForm | Niche; strong where it fits |
+
+The big 2024 events that shaped the landscape:
+- **Databricks acquired Tabular (Iceberg's commercial backer) for ~$1B**, signaling that even Databricks accepts Iceberg's win. UniForm now lets Delta tables be read as Iceberg.
+- **Snowflake released Polaris** as an open Iceberg catalog, ending its closed-table era.
+- **AWS announced S3 Tables** — Iceberg as a first-class S3 storage type with built-in optimization.
+- **Cloudflare R2 added an Iceberg catalog** for egress-free lakehouse on R2.
+
+The strategic read in 2026: **Iceberg is the open table format winner.** Pick it for new lakehouse work unless you have a specific reason to choose Delta (deep Databricks investment) or Hudi (heavy update workload, already on it).
+
+### Cost & ops burden
+
+| Flavor | Cost (relative) | Ops burden | When it's the right answer |
+|---|---|---|---|
+| **Self-managed (S3 + Glue/Nessie/Polaris)** | object storage cost only (~$23/TB-month) | Medium — compaction, expiration, catalog ops | Default for cost-sensitive lakehouse |
+| **AWS S3 Tables** | small premium over raw S3 | Low — AWS handles compaction and maintenance | AWS-centric, want managed Iceberg without running it |
+| **Snowflake managed Iceberg** | 1.5–2× normal Snowflake | Low — Snowflake runs the catalog and tables | Already Snowflake-heavy; want lakehouse interop |
+| **Databricks managed (Unity + Iceberg/Delta UniForm)** | normal Databricks cost | Low — Unity Catalog handles governance | Databricks-heavy organization |
+| **Tabular (acquired by Databricks)** | premium SaaS | Low — turnkey Iceberg | Want an opinionated managed Iceberg experience |
+| **Cloudflare R2 + Iceberg Catalog** | R2 storage (no egress fees) | Medium — newer ecosystem | Cost-sensitive, multi-cloud reads, want zero egress |
+
+The honest summary: **the engine is free, the storage is cheap, and the operational burden is in the maintenance jobs and the catalog.** Iceberg's cost story is what makes it disruptive to traditional warehouses — petabytes for thousands of dollars per month, queryable by any engine. The hidden cost is the discipline to run compaction and expiration jobs reliably.
+
+### War stories
+- **Netflix — birthplace (2017–2018).** Built Iceberg to escape Hive's operational pain: full-table scans from missing partition filters, atomic-rename-based commits that broke under S3 eventual consistency, schema evolution that required rewriting partitions. Public posts and the original paper *"Apache Iceberg: An Architectural Look Under the Covers"* are foundational. Lesson: **the data lake's biggest historical problems were not about data, they were about metadata.**
+- **Apple — large-scale Iceberg adopter.** Public talks at Iceberg Summit describe deploying Iceberg across enormous internal datasets, including patterns for partition evolution and concurrent writes. Lesson: **at petabyte scale, partition evolution without rewriting data is not a nice-to-have; it is the difference between a one-week change and a six-month migration.**
+- **Stripe — Iceberg for analytical events.** Public posts cover the architecture: services emit events to Kafka, Spark/Flink land them in Iceberg, downstream BI and ML read from there. Lesson: **Kafka + Iceberg is the modern default for the "central nervous system" of a data platform — Kafka for hot, Iceberg for warm/cold.**
+- **Pinterest — moving off Hive.** Public posts describe migrating large Hive-partitioned tables to Iceberg, with the small-file problem being the dominant operational lesson. Lesson: **migrating to Iceberg is straightforward; running Iceberg without compaction is worse than staying on Hive.**
+- **Adobe — Iceberg for Adobe Experience Platform.** Public engineering posts describe choosing Iceberg early (2019) and the operational maturity required at scale. Lesson: **early adopters paid a tax in tooling that mid-adopters in 2025+ don't have to pay. The ecosystem is now mature.**
+- **Databricks ↔ Tabular acquisition (2024, ~$1B).** Databricks bought Tabular (founded by Iceberg's original creators at Netflix) for around a billion dollars. The acquisition signaled that even Iceberg's biggest commercial competitor accepted that Iceberg had won the open table format war. Lesson: **format wars in data infra resolve in 5–7 years; the winner becomes infrastructure. Iceberg in 2026 is what Parquet was in 2018.**
+- **AWS S3 Tables (re:Invent 2024).** AWS made Iceberg a first-class S3 storage type with managed compaction. Lesson: **when the largest cloud provider builds something into the storage layer itself, the format has crossed from "trend" to "default."**
+- **The cautionary tale — every team running streaming writes once.** Set up Spark Structured Streaming → Iceberg → forget compaction → six weeks later, queries are 100× slower than they should be, S3 list operations dominate the bill, and nobody understands why. Lesson: **compaction and expiration are not optional cron jobs; they are the contract.**
+
+---
+
+---
+
+<a id="elasticsearch"></a>
+## Elasticsearch
+
+### Identity
+A distributed, JSON-document-oriented **search and analytics engine** built on Apache Lucene. Created in 2010 by Shay Banon, now maintained by Elastic (SSPL/Elastic License since 2021, not Apache). The default answer when the requirement contains the word "search" — full-text, fuzzy, faceted, autocomplete, log search, or "find documents that match this complex set of conditions." Also widely (and sometimes wrongly) used as an analytics database and log store.
+
+### Mental model
+A **distributed library card catalog that can answer almost any question about the cards, fast**. Every document (card) is analyzed at write time — broken into tokens, stemmed, lowercased, n-grammed — and filed into an **inverted index**: a map from every term to every document that contains it. A search query is a lookup in this inverted index, not a scan. This is why search over 100M documents returns in 50 ms while a Postgres `LIKE '%term%'` on the same data takes minutes — fundamentally different data structure.
+
+### How an inverted index actually works
+
+The core difference from every other system in this doc. Every database scans forward through rows; Elasticsearch looks up terms backward to find documents.
+
+```text
+FORWARD INDEX (Postgres row store)            INVERTED INDEX (Elasticsearch)
+──────────────────────────────────            ─────────────────────────────
+
+doc_id → content                              term → doc_ids
+                                              
+1 → "kafka streaming log analyzer"           "kafka"      → [1, 4]
+2 → "spark structured streaming job"         "streaming"  → [1, 2]
+3 → "redis cache aside pattern"              "log"        → [1]
+4 → "kafka consumer group rebalance"         "analyzer"   → [1]
+                                             "spark"      → [2]
+                                             "structured" → [2]
+query: "kafka streaming"                     "job"        → [2]
+                                             "redis"      → [3]
+postgres: scan ALL rows,                     "cache"      → [3]
+  check each for both words                  "aside"      → [3]
+  → O(N) where N = total rows               "pattern"    → [3]
+                                             "consumer"   → [4]
+elasticsearch: look up "kafka" → [1,4]       "group"      → [4]
+               look up "streaming" → [1,2]   "rebalance"  → [4]
+               intersect → [1]
+               → O(1) per term, then set intersection
+               fast regardless of total document count
+```
+
+This is why Elasticsearch feels magical for search and why it is wrong for analytics — the data structure is optimized for "which documents match?" not "what is the average across all documents?"
+
+### Sweet spot
+- **Full-text search** across millions or billions of documents: product catalog search, site search, knowledge base, documentation search.
+- **Log search** (the ELK stack: Elasticsearch + Logstash + Kibana). "Show me all error logs from service X containing 'timeout' in the last hour."
+- **Autocomplete and typeahead** using n-gram tokenizers and prefix queries.
+- **Faceted navigation** — "filter by brand, color, size, price range" on an e-commerce site. Aggregations on bucketed fields are fast and natural.
+- **Fuzzy and phonetic search** — misspellings, synonyms, stemming, multilingual.
+- **Security event search** (SIEM use case). Splunk's open-source alternative stack is often Elasticsearch + Kibana.
+- **Geospatial search** with full-text — "restaurants near me matching 'sushi'."
+- **Any workload where the query is "find me the best matches" rather than "give me an exact answer."**
+
+### Don't use it for
+- **Source of truth.** Elasticsearch is an index, not a database. The primary data should live in Postgres, Kafka, or S3. Rebuild the index when things go wrong, not the other way around.
+- **OLTP.** No transactions, no foreign keys, no real UPDATE (delete + re-index). Updating a single field re-indexes the entire document.
+- **Exact-answer analytics over billions of rows.** ClickHouse is 10–50× faster and cheaper for "count/sum/avg grouped by X." Elasticsearch can aggregate, but the inverted index adds overhead that column stores don't pay.
+- **As a primary log store for cost-sensitive, long-retention scenarios.** Elasticsearch keeps data hot (on SSD/RAM); cold-tier exists but is operationally heavier than landing logs directly in Iceberg/Parquet on S3. Uber's public post on moving from Elasticsearch to ClickHouse for logs cites 10× cost reduction.
+- **High write throughput of structured data that nobody searches.** If you're writing metrics or events and only querying with `GROUP BY`, you're paying the index-build cost for nothing.
+- **Storing large binary blobs.** The index grows; search doesn't improve. Use object storage.
+- **When you actually need a relational join.** Elasticsearch has no joins. Nested objects and parent-child relationships exist but are limited and expensive.
+
+### How it breaks at scale
+
+```text
+   scale →   10 GB         100 GB        1 TB/index    10 TB+        multi-cluster
+              │             │             │             │             │
+  cliff:   ┌──┴──┐       ┌──┴──┐       ┌──┴──┐       ┌──┴──┐       ┌──┴──┐
+           │Mappi│       │Shard │      │Merge │      │ JVM │       │Cross-│
+           │ng   │       │ size │      │storm │      │heap │       │clustr│
+           │explo│       │ pain │      │      │      │wall │       │search│
+           │sion │       │      │      │      │      │     │       │      │
+           └─────┘       └──────┘      └──────┘      └──────┘      └─────┘
+   fix:  Strict mapping  Target 20-   Tune merge    31 GB heap    CCS / CCR
+         + dynamic:false 50 GB/shard  policy;       max (no       (Elastic),
+         from day 1      + ILM for    index         compressed    or per-region
+                         lifecycle    templates     oops JVM      clusters
+                                                    limit)
+```
+
+1. **Mapping explosion (the first cliff, hits early).** Elasticsearch auto-detects field types on first encounter. Throw in uncontrolled JSON and you get thousands of fields, each with its own inverted index, stored fields, and doc values. Memory and disk bloat, cluster refuses new fields past the limit. **Fix: `dynamic: false` or `dynamic: strict` from day one. Define your mapping explicitly. This is the Prometheus-cardinality-equivalent for Elasticsearch.**
+
+2. **Shard sizing.** Shards are the unit of parallelism and the unit of operational pain. Too many small shards → high per-shard overhead (each shard is a Lucene index, holding heap memory). Too few large shards → recovery takes hours, and one hot shard is the bottleneck. **Sweet spot: 20–50 GB per shard. Use index lifecycle management (ILM) to roll over time-based indices automatically.**
+
+3. **Merge storms.** Lucene segments are immutable; updates create new segments; background merges consolidate them. Under heavy write load, merges fall behind, search latency spikes, and the cluster looks "stuck." **Fix: tune `merge.scheduler.max_thread_count`, use time-based indices so old indices stop merging, and design for append-mostly workflows.**
+
+4. **The 31 GB JVM heap wall.** Elasticsearch is Java. The JVM's compressed ordinary object pointers (compressed oops) work up to ~31 GB heap. Set heap to 32 GB or more and you *lose* memory efficiency — the effective usable heap drops. **Default rule: 31 GB max heap, 50% of machine memory, the other 50% for OS page cache (which Lucene relies on heavily).** This means a single node is practically capped at ~64 GB RAM. Scale-out is the only path beyond that.
+
+5. **Cross-cluster complexity.** Cross-cluster search (CCS) and cross-cluster replication (CCR) exist but are Elastic-licensed features with operational overhead. Most teams run independent clusters per region or use case and accept the boundary.
+
+### What seniors watch for
+- **`dynamic: true` in production mappings.** Automatic field creation is the mapping-explosion fuse. Turn it off.
+- **No ILM policy for time-series indices.** Indices grow forever, shards multiply, cluster degrades. Rollover + warm/cold/delete tiers are not optional for logs.
+- **Heap set above 31 GB.** Instant flag in a review. The compressed-oops cliff is not intuitive but is well-documented.
+- **Using Elasticsearch as the primary data store** with no rebuild path. The cluster corrupts, the index needs rebuilding, and the source data doesn't exist. This is the number one Elasticsearch war story.
+- **Text fields used where keyword fields should be.** `text` fields get analyzed (tokenized, stemmed); `keyword` fields are exact. Filtering on a `text` field triggers full-text scoring when you just wanted a filter. Performance and relevance both suffer.
+- **Deep pagination** (`from: 10000, size: 10`). Elasticsearch must score and sort all 10,010 documents, then throw away 10,000. Use `search_after` or the scroll API for deep pagination.
+- **Giant documents** (>1 MB). Each field is analyzed and indexed; large documents chew through CPU and memory at index time. Chunk or exclude large fields.
+- **Aggregation queries over high-cardinality fields** (e.g., "count distinct user_ids across 1B logs"). Works, but uses significant heap. At high cardinalities, ClickHouse or HyperLogLog approximations are better.
+- **Reindex operations without capacity planning.** Reindexing a 5 TB index hammers the cluster; schedule it, throttle it, or use aliases to swap indices.
+- **Choosing Elasticsearch for analytics because "we already have it for logs."** The sunk-cost trap. Logs search and analytics have different cost profiles and query patterns. Layering analytics on the log cluster works until it doesn't.
+
+### Elasticsearch vs OpenSearch (the fork)
+
+In 2021, Elastic changed Elasticsearch's license from Apache 2.0 to SSPL + Elastic License, prohibiting cloud providers from offering it as a service. AWS forked the last Apache-licensed version (7.10) into **OpenSearch**. The landscape in 2026:
+
+| Dimension | Elasticsearch (Elastic) | OpenSearch (AWS/community) |
+|---|---|---|
+| **License** | Elastic License / SSPL (not open-source by OSI definition) | Apache 2.0 (open-source) |
+| **Managed service** | Elastic Cloud | AWS OpenSearch Service, self-hosted |
+| **Features** | Advanced ML, vector search, security analytics (proprietary) | Community-driven, growing feature set |
+| **Compatibility** | Original; plugins are Elastic-ecosystem | Fork; some community plugins, diverging API surface |
+| **When to pick** | Want latest features, willing to pay Elastic | AWS-native, need OSS license, or cost-sensitive |
+
+Both are "Elasticsearch" under the hood (Lucene). The codebase diverged in 2021. **For new projects, pick based on cloud and licensing constraints, not technical superiority.**
+
+### Cost & ops burden
+
+| Flavor | Cost (relative) | Ops burden | When it's the right answer |
+|---|---|---|---|
+| **Self-managed OSS (OpenSearch)** | 1× | High — cluster ops, capacity planning, JVM tuning, ILM, upgrades | Cost-sensitive; have ops expertise |
+| **AWS OpenSearch Service** | 2–4× | Low–medium — managed nodes, but shard/mapping design still yours | AWS-native; logs and search workloads |
+| **Elastic Cloud** | 3–6× | Low — Elastic handles cluster, auto-scaling, upgrades | Want latest Elastic features; search is core to the product |
+| **Alternatives for logs — Loki** | 0.2–0.5× ES cost | Low — log-native, stores labels + chunks on S3 | Logs only, don't need full-text search, Grafana-centric |
+| **Alternatives for logs — ClickHouse** | 0.3–0.5× ES cost | Medium — see ClickHouse section | Need analytics over logs more than search |
+| **Alternatives for search — Meilisearch, Typesense** | 1× | Low — single binary, simpler | Product search at smaller scale; don't need distributed cluster |
+
+The honest summary: **Elasticsearch is expensive to run because data is indexed in RAM-backed structures, replicated across nodes, and Lucene segments need beefy SSDs.** The per-GB storage cost is 5–20× that of Parquet on S3. This is fine for search workloads (the value is in the index, not the storage). It is not fine for "we put all our logs here because Kibana looks nice" — that is the single biggest Elasticsearch cost trap in the industry.
+
+### War stories
+- **Wikipedia — search at scale.** Runs Elasticsearch (via CirrusSearch plugin for MediaWiki) powering search across hundreds of millions of articles in hundreds of languages. Public documentation covers the architecture. Lesson: **full-text search with multilingual analysis, fuzzy matching, and relevance tuning is Elasticsearch's home territory. Nothing else is close for this use case.**
+- **GitHub — code search (2023).** Built a custom search infrastructure on Elasticsearch (later augmented with Blackbird, a Rust-based indexer) to search 200M+ repositories. Public engineering post: *"The technology behind GitHub's new code search."* Lesson: **Elasticsearch anchors the search workflow, but extreme-scale code search requires domain-specific augmentation — Elasticsearch alone isn't the whole answer at GitHub's scale.**
+- **Uber — moving logs off Elasticsearch (2020).** Migrated from an Elasticsearch-based logging stack to ClickHouse, citing 10× cost reduction and better query performance for analytical log queries. Public post: *"Fast and Reliable Schema-Agnostic Log Analytics Platform."* Lesson: **"search" and "analytics" are different workloads with different cost profiles. Using a search engine for analytics over logs burns money.**
+- **Netflix — Elasticsearch for distributed tracing and search.** Public posts describe using Elasticsearch for searching traces and metadata across their microservices fleet. Lesson: **the "find me the needle" workload is where Elasticsearch earns its keep. The "show me the haystack's statistics" workload belongs elsewhere.**
+- **Grafana Labs — building Loki as the anti-Elasticsearch.** Loki deliberately stores log lines unindexed in object storage, indexing only labels. Public posts and talks describe the motivation: Elasticsearch for logs was 10× too expensive for most teams. Lesson: **the full-text index is a luxury. If your "search" is really "filter by service + grep for a keyword," Loki does it at a fraction of the cost.**
+- **Elastic ↔ AWS fork (2021).** Elastic changed the license; AWS forked OpenSearch; the community split. Public blog posts from both sides document the arguments. Lesson: **open-source licensing is an infrastructure dependency. If your build depends on a specific license, track it like you track a breaking API change.**
+- **The cautionary tale — mapping explosion.** A team ships a new microservice that logs request headers as top-level JSON fields. Each unique header name becomes a new field in the mapping. Within days: thousands of fields, heap exhaustion, cluster degradation, cascading failures in the logging pipeline. No single famous post-mortem because every team that has run Elasticsearch at scale has a version of this story. Lesson: **`dynamic: strict` is the seatbelt. Wear it.**
+
+---
+
+*Next up: Cassandra.*
