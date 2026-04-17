@@ -36,8 +36,8 @@ A scenarios chapter at the end works the other direction: starting from the **pr
 7. [ZooKeeper](#zookeeper)
 8. [Apache Iceberg](#iceberg)
 9. [Elasticsearch](#elasticsearch)
-10. Cassandra
-11. Scenarios — payments, e-commerce, Black Friday, search, observability, data lake, leaderboards, fraud, recommendations, multi-tenant SaaS
+10. [Cassandra](#cassandra)
+11. [Scenarios](#scenarios) — payments, e-commerce, Black Friday, search, observability, data lake, leaderboards, fraud, recommendations, multi-tenant SaaS
 12. Decision flowchart
 13. Anti-pattern hall of fame
 
@@ -1163,3 +1163,549 @@ The honest summary: **Elasticsearch is expensive to run because data is indexed 
 ---
 
 *Next up: Cassandra.*
+
+---
+
+<a id="cassandra"></a>
+
+## Cassandra
+
+### Identity
+A masterless, wide-column **distributed database** designed for massive write throughput and linear horizontal scale across commodity hardware. Originally built at Facebook for inbox search (2007), open-sourced, now an Apache project. The defining trade-off: Cassandra sacrifices read flexibility and strong consistency to achieve write-anywhere availability across data centers. If your workload is "write a lot, read by known keys, never go down," Cassandra is the obvious answer. If your workload includes "I'd like to query this flexibly," you will suffer.
+
+### Mental model
+A **distributed hash ring of identical nodes where every write is an append**. There is no master, no leader election, no single point of failure. Data is partitioned by a hash of the partition key and replicated to N nodes clockwise around the ring. Any node can accept any write for any partition — it just forwards to the correct replicas. This is why it writes so fast: no coordination, no consensus, just "accept the mutation, replicate it, sort it out later." The "sort it out later" part is eventual consistency, and it is both the superpower and the price you pay.
+
+### How the write path actually works
+
+The core reason Cassandra writes faster than almost anything else at scale. Every write is sequential I/O — no random disk seeks, no read-before-write.
+
+```text
+CLIENT WRITE
+    │
+    ▼
+┌────────────┐   1. Append to commit log     ┌──────────────┐
+│ Coordinator │ ─────────────────────────────▶│  Commit Log  │
+│   (any node)│                               │ (sequential) │
+└─────┬──────┘                                └──────────────┘
+      │
+      │  2. Write to memtable (in-memory sorted structure)
+      ▼
+┌────────────┐
+│  Memtable  │──── sorted by clustering key
+│   (RAM)    │
+└─────┬──────┘
+      │  3. Flush when full
+      ▼
+┌────────────┐
+│  SSTable   │──── immutable, sorted, on disk
+│  (on disk) │
+└────────────┘
+      │  4. Background compaction merges SSTables
+      ▼
+┌────────────┐
+│  Merged    │──── fewer files, tombstones cleaned
+│  SSTable   │
+└────────────┘
+
+Read path (the expensive one):
+  → Check memtable
+  → Check bloom filters on each SSTable
+  → Read matching SSTables
+  → Merge results, resolve conflicts by timestamp (last-write-wins)
+  → Return to client
+```
+
+Writes touch only sequential I/O (commit log append) and RAM (memtable). Reads must potentially consult multiple SSTables and merge. **This is why Cassandra is a write-optimized system that trades read efficiency for write speed.** Every data model decision you make is about keeping the read path short.
+
+### The data modeling paradigm (query-first design)
+
+This is the thing that trips up every engineer coming from the relational world. In Postgres, you model the entities, normalize, and write any query you want. In Cassandra, you **start with the queries and design the tables backward from them**. One query = one table. Denormalization is not a smell, it is the architecture.
+
+```text
+RELATIONAL THINKING                    CASSANDRA THINKING
+──────────────────                     ──────────────────
+
+"What entities exist?"                 "What queries will the app run?"
+     │                                      │
+     ▼                                      ▼
+ Normalize into tables               One table per query pattern
+     │                                      │
+     ▼                                      ▼
+ Write any query (JOIN, WHERE,        Partition key = equality filter
+  GROUP BY, subqueries)               Clustering key = range/sort
+     │                                      │
+     ▼                                      ▼
+ Optimize later with indexes          No JOINs, no ad-hoc queries,
+                                      no GROUP BY across partitions
+```
+
+**Partition key** determines which node stores the data. **Clustering key** determines sort order within a partition. If your query doesn't align with these keys, you either do a full-cluster scatter query (slow, defeats the purpose) or you create another table that does align. This is why Cassandra clusters often have 3–5× the table count of the equivalent Postgres schema.
+
+### Sweet spot
+- **Time-series event data at massive write scale.** IoT sensor data, user activity streams, application event logs where writes are 10–100× reads. The append-only write path and time-based clustering keys are purpose-built for this.
+- **Messaging and inbox-style workloads.** The original use case at Facebook. Partition by user, cluster by timestamp, read the most recent N. Discord used Cassandra (later Scylla) for trillions of messages.
+- **Write-heavy workloads across multiple data centers.** Masterless replication means every DC can accept writes independently with no cross-DC latency on the write path. Active-active multi-region for real.
+- **Personalization and user profile stores** at scale. Partition by user_id, denormalize the profile + preferences + recent activity. Netflix stores billions of subscriber records this way.
+- **Device and fleet management state.** Millions of devices reporting telemetry, each identified by device_id. Apple reportedly runs one of the largest Cassandra deployments for iCloud and device-state workloads.
+- **Any workload where "never go down" matters more than "always consistent."** Cassandra at RF=3 with `LOCAL_QUORUM` reads/writes survives node failures, rack failures, and even a DC failure without human intervention.
+
+### Don't use it for
+- **Anything that needs ad-hoc queries.** If the product manager might say "can we also filter by X?" next quarter, and X isn't in your partition key, you're either building a new table or suffering. Postgres or Elasticsearch handle this effortlessly.
+- **Small datasets.** Below 100 GB or a few hundred thousand writes per second, Cassandra's operational complexity isn't justified. Postgres with read replicas will do fine and give you real queries.
+- **Workloads requiring strong consistency or transactions.** Lightweight transactions (LWT / Paxos) exist but are 4–10× slower than normal writes. If every write needs a compare-and-set, Cassandra is fighting its own design.
+- **Analytics and aggregations.** No GROUP BY across partitions, no JOINs, no window functions. Export to Spark or ClickHouse for analytics. Using Cassandra for OLAP is burning money and developer sanity.
+- **Workloads with frequent updates and deletes.** Cassandra doesn't update in place — it writes a new timestamped version. Deletes write a tombstone that lingers until compaction. Heavy update/delete patterns create tombstone storms that degrade reads to the point of timeouts.
+- **Secondary index-heavy access patterns.** Cassandra's secondary indexes (SASI, SAI, or the legacy kind) are local to each node, meaning a secondary-index query must scatter to every node. This is fine for low-cardinality filtering on small result sets; it is catastrophic at scale.
+- **Anything that needs referential integrity.** No foreign keys, no constraints, no cascading deletes. Your application owns all consistency.
+
+### How it breaks at scale
+
+```text
+   scale →   100 GB       1 TB          10 TB         100 TB+       multi-DC
+              │             │             │             │             │
+  cliff:   ┌──┴──┐       ┌──┴──┐       ┌──┴──┐       ┌──┴──┐       ┌──┴──┐
+           │Tomb-│       │Parti│       │Compa-│       │ JVM │       │Confl-│
+           │stone│       │tion │       │ction │       │ GC  │       │ict   │
+           │storm│       │ hot │       │ IO   │       │pause│       │resol-│
+           │     │       │spots│       │storm │       │     │       │ution │
+           └─────┘       └──────┘      └──────┘      └──────┘      └─────┘
+   fix:  Tune gc_grace  Bucket by     Choose         Off-heap     LWTs for
+         + avoid        time or       compaction     + G1GC +     critical
+         delete-heavy   shard large   strategy       heap < 31G   paths; or
+         patterns       partitions    (LCS vs        or move      switch to
+                                      STCS vs        to Scylla    CRDT-based
+                                      TWCS)          (no JVM)     resolution
+```
+
+1. **Tombstone storms (the first cliff, hits early).** Deletes in Cassandra don't remove data — they write a tombstone marker that says "this is dead." Tombstones accumulate until compaction runs. If a read hits a partition with thousands of tombstones, it must scan through all of them before returning results. At the default `gc_grace_seconds` of 10 days, tombstones pile up. Teams that delete frequently (TTL-based expiry on dense partitions, queue-like patterns) hit read timeouts. **Fix: use `TWCS` compaction for time-series (drops whole SSTables when they expire), keep `gc_grace_seconds` aligned with your repair schedule, and fundamentally avoid delete-heavy access patterns.**
+
+2. **Partition hot spots.** All data for a partition key lives on the same set of nodes. Pick a bad partition key (e.g., `country` when 80% of traffic is US, or `date` when today's partition gets all the writes) and you have a hot node while the rest of the ring is idle. **Fix: add a bucketing dimension to the partition key. `(sensor_id, date_bucket)` instead of just `sensor_id`. The trade-off: reads now need to query multiple partitions and merge client-side.**
+
+3. **Compaction I/O storms.** Compaction merges SSTables in the background. Under heavy write load, compaction falls behind, pending SSTables pile up, read latency degrades (more files to consult), and a sudden compaction burst saturates disk I/O. **Fix: choose the right compaction strategy — TWCS for time-series, LCS for read-heavy with updates, STCS (default) for write-heavy. Provision SSDs, never spinning disks. Monitor `pending compaction` in nodetool.**
+
+4. **JVM GC pauses (the Java tax).** Cassandra is Java. Large heaps mean long GC pauses. Long GC pauses mean the node looks dead to the cluster, triggers hinted handoff or streaming, and creates a cascading mess. **Fix: keep heap at 8–16 GB (never above 31 GB for the same compressed-oops reason as Elasticsearch), use G1GC, and let the OS page cache handle the rest. Or migrate to ScyllaDB — a C++ Cassandra-compatible rewrite that eliminates the JVM entirely and claims 10× throughput per node.**
+
+5. **Multi-DC conflict resolution surprises.** With active-active writes to multiple data centers, conflicts are resolved by last-write-wins (highest timestamp). If clocks are skewed (even by milliseconds), the "wrong" write can silently win. NTP drift is the silent killer. **Fix: use NTP with tight sync, prefer `LOCAL_QUORUM` consistency level (per-DC quorum without cross-DC latency), and design the data model so concurrent writes to the same cell are rare. For truly conflict-sensitive operations, use LWTs (Paxos) — but accept the latency cost.**
+
+6. **Scaling down is harder than scaling up.** Adding nodes is straightforward (the ring rebalances). Removing nodes requires streaming data off them, which is slow and I/O-heavy. Decommissioning nodes from a large cluster can take days. **Most teams over-provision and accept the cost rather than attempt to shrink.**
+
+### What seniors watch for
+- **Partition key design that doesn't match query patterns.** The single most impactful decision. Get it wrong and you rebuild the table. Every code review of a Cassandra schema should start with "what queries does this serve?"
+- **Unbounded partition growth.** A partition key of `user_id` for a messaging app means one user's partition grows forever. Eventually the partition exceeds the practical limit (~100 MB, hard limit 2 GB) and reads degrade. **Bucket by time: `(user_id, month)` or `(user_id, conversation_id)`.**
+- **`ALLOW FILTERING` in production queries.** This keyword means "I know this will do a full-cluster scan, do it anyway." It exists for dev convenience. In production it is a time bomb.
+- **`SELECT *` across partitions without `LIMIT`.** Unbounded scatter-gather queries that fan out to every node and return unbounded data. Kills the coordinator node.
+- **Lightweight transactions (LWT) used for hot paths.** LWTs use Paxos: 4 round trips per operation. If your hot write path needs LWT, your data model is wrong for Cassandra.
+- **Consistency level `ALL` used casually.** `ALL` means every replica must respond — a single slow or dead node fails the query. Use `LOCAL_QUORUM` (majority in the local DC) for the balance of consistency and availability.
+- **No `nodetool repair` schedule.** Anti-entropy repair is how Cassandra ensures replicas converge. Without regular repairs, data drifts silently. Must run at least every `gc_grace_seconds` (default 10 days) or risk resurrecting deleted data (zombie rows).
+- **Mixing workload types on the same cluster.** Batch analytics queries on a cluster serving real-time traffic. The analytics queries saturate disk I/O and compaction resources, spiking P99 for the latency-sensitive path.
+- **TTL on large partitions without TWCS.** TTL-based expiry generates tombstones. Without TWCS (which drops entire SSTables once all data has expired), those tombstones accumulate and degrade reads.
+- **Running repairs during peak traffic.** Repair is I/O and network heavy. Schedule it during off-peak, or use incremental repairs with sub-range partitioning.
+
+### Cassandra vs ScyllaDB (the C++ rewrite)
+
+ScyllaDB is a drop-in Cassandra replacement written in C++ (Seastar framework), eliminating the JVM and its GC pauses. The landscape:
+
+| Dimension | Cassandra (Apache) | ScyllaDB |
+|---|---|---|
+| **Language** | Java (JVM) | C++ (Seastar, shard-per-core) |
+| **GC pauses** | Yes — the defining operational headache | None — no JVM |
+| **Throughput per node** | Baseline | 5–10× higher (fewer nodes needed) |
+| **Compatibility** | Original; CQL, SSTable format | CQL-compatible; most drivers work unchanged |
+| **Compaction** | Background threads, can spike latency | Incremental compaction, more predictable latency |
+| **Community / ecosystem** | Massive; 15+ years, battle-tested | Growing; Discord, Expedia, Zillow among public users |
+| **Managed service** | AWS Keyspaces, DataStax Astra, Instaclustr | ScyllaDB Cloud |
+| **When to pick** | Existing Cassandra expertise; proven at scale | Greenfield; want fewer nodes, lower tail latency |
+
+**For new projects with Cassandra-shaped workloads, ScyllaDB is increasingly the default recommendation** — same data model, same CQL, but fewer nodes and no JVM tuning. For existing Cassandra clusters, migration is feasible but non-trivial.
+
+### Cost & ops burden
+
+| Flavor | Cost (relative) | Ops burden | When it's the right answer |
+|---|---|---|---|
+| **Self-managed Apache Cassandra** | 1× | High — ring management, compaction tuning, repair scheduling, JVM tuning, capacity planning | Deep expertise; cost-sensitive; need full control |
+| **DataStax Astra (managed Cassandra)** | 3–5× | Low — serverless or provisioned, auto-scaling | Want Cassandra semantics without the ops |
+| **AWS Keyspaces** | 2–4× | Low — serverless CQL, pay-per-request | Low-throughput CQL workloads on AWS; limited feature set |
+| **ScyllaDB Cloud** | 2–3× (but fewer nodes) | Low–medium — managed, but schema design still yours | Cassandra workload shape; want better price/performance |
+| **Self-managed ScyllaDB** | 0.3–0.5× (via node reduction) | Medium — no JVM, but still ring ops, compaction, repair | Ops team exists; want to cut Cassandra costs 3–5× |
+
+The honest summary: **Cassandra is cheap per GB stored but expensive per engineer-hour operated.** The database itself is free; the humans who tune compaction, schedule repairs, right-size partitions, and get paged at 3 AM for GC pauses are not. ScyllaDB removes one dimension of pain (JVM) but the data-modeling complexity — which is the real cost — remains identical.
+
+### War stories
+- **Discord — trillions of messages on Cassandra, then migration to ScyllaDB (2023).** Originally chose Cassandra for the write-heavy, partition-per-channel model. At trillions of messages, GC pauses caused cascading latency spikes. Migrated to ScyllaDB, same data model, dramatically better tail latency. Public blog post: *"How Discord Stores Trillions of Messages."* Lesson: **Cassandra's data model was right; the JVM was the bottleneck. ScyllaDB inherits the model without the GC tax.**
+- **Netflix — personalization and subscriber state.** One of the largest public Cassandra deployments. Stores subscriber activity, viewing history, and personalization data across multiple regions with active-active replication. Public talks at Cassandra Summit describe multi-DC consistency strategies. Lesson: **masterless replication across regions is Cassandra's killer feature. Netflix designs for eventual consistency at the application layer and avoids LWTs on hot paths.**
+- **Apple — reportedly the largest Cassandra deployment (2015 figure: 150K+ nodes).** Powers iCloud and other services. Scale is the point — nothing else runs a ring that large. Lesson: **Cassandra's linear scale-out is real, but operating at this size requires dedicated database teams, custom tooling, and deep JVM expertise.**
+- **Instagram — migration away from Cassandra to their own storage.** Initially used Cassandra for the feed, then built custom systems as access patterns evolved beyond what query-first modeling could serve efficiently. Lesson: **when your queries change faster than you can rebuild tables, Cassandra's rigidity becomes a liability. This is the anti-pattern: choosing Cassandra for a product whose access patterns are still evolving.**
+- **Uber — Cassandra for driver/rider matching state.** Public talks describe using Cassandra for real-time geospatial state in the dispatch system, with careful partition key design around geohash buckets. Lesson: **creative partition key design can make Cassandra work for workloads it wasn't originally designed for — but it requires deep understanding of the access pattern.**
+- **The cautionary tale — tombstone storm.** A team builds a queue on Cassandra: write a row, read it, delete it. Classic queue pattern. Reads become progressively slower. P99 read latency goes from 10 ms to 10 seconds. Cluster appears healthy, CPU is low, disk is fine. The root cause: millions of tombstones in each partition that every read must skip over. The fix required changing the data model to use TTLs with TWCS compaction and abandoning the queue pattern entirely. No single famous post-mortem because this is the most common Cassandra anti-pattern — **do not build a queue on Cassandra.**
+
+---
+
+<a id="scenarios"></a>
+
+## Scenarios
+
+The database sections above work top-down: here is a system, here is what it's good for. This chapter works **bottom-up**: here is a problem, here is the stack a senior engineer would reach for, and here is why. Each scenario names the dominant workload shape, the obvious pick, the alternatives, and the trap that gets teams in trouble.
+
+---
+
+### 1. Payments
+
+**The workload shape:** Low-throughput, high-correctness writes. Every transaction must be ACID. Auditability is a regulatory requirement. Reads are a mix of point lookups ("show me this payment") and analytical queries ("total refunds this quarter"). Double-charging a customer is a career-ending, lawsuit-inviting event.
+
+**The stack:**
+
+```text
+┌─────────────────────────────────────────────────────┐
+│                   Application                       │
+└──────────┬──────────────────────┬───────────────────┘
+           │ writes               │ reads
+           ▼                      ▼
+   ┌──────────────┐       ┌──────────────┐
+   │  PostgreSQL  │──────▶│  PostgreSQL  │
+   │   (primary)  │  WAL  │  (read replica│
+   │              │ repli │   for reports)│
+   └──────┬───────┘ cation└──────────────┘
+          │
+          │ CDC (Debezium / WAL)
+          ▼
+   ┌──────────────┐       ┌──────────────┐
+   │    Kafka     │──────▶│  ClickHouse  │
+   │  (event log) │       │ (analytics)  │
+   └──────────────┘       └──────────────┘
+```
+
+**Why Postgres:** Transactions, foreign keys, constraints, CHECK clauses, serializable isolation. The data model is relational by nature (users, accounts, transactions, ledger entries). Postgres's `SERIALIZABLE` isolation level prevents the phantom reads that cause double-charges. The WAL is your audit log's backbone.
+
+**Why not:**
+- **Cassandra** — no transactions, no joins, last-write-wins conflict resolution. A payment system on Cassandra is a lawsuit in incubation.
+- **Redis** — not a source of truth. Caching payment status is fine; storing it is not.
+- **MongoDB** — multi-document transactions exist now, but the relational model is a better fit for the inherently relational domain of accounting.
+
+**The trap:** Running analytics directly on the OLTP primary. The monthly reconciliation query that table-scans 500M rows and pins CPU at 100% for 20 minutes, degrading checkout latency. **Fix: CDC to Kafka → ClickHouse for analytics. The OLTP database does OLTP; the analytics database does analytics.**
+
+---
+
+### 2. E-commerce (product catalog + orders)
+
+**The workload shape:** Mixed. The product catalog is read-heavy with complex queries (filter by category, price, brand, text search, facets). The order pipeline is write-heavy with strict consistency needs. Inventory is a hot counter. These are three different workload shapes pretending to be one system.
+
+**The stack:**
+
+```text
+   ┌────────────┐
+   │  Product   │──▶ Elasticsearch (search, facets, autocomplete)
+   │  Catalog   │──▶ Postgres (source of truth, admin CRUD)
+   └────────────┘
+
+   ┌────────────┐
+   │   Orders   │──▶ Postgres (ACID, relational: orders → line_items → payments)
+   └────────────┘
+
+   ┌────────────┐
+   │ Inventory  │──▶ Redis (hot counter for "in stock" during checkout)
+   │            │──▶ Postgres (source of truth, reconciled async)
+   └────────────┘
+
+   ┌────────────┐
+   │  Sessions  │──▶ Redis (hash per session, TTL = session timeout)
+   └────────────┘
+```
+
+**Why this split:** Each sub-problem has a different shape. Search is an Elasticsearch problem (inverted index, fuzzy matching, facets). Orders are a Postgres problem (transactions, referential integrity). Inventory at checkout speed is a Redis problem (atomic `DECR`, sub-millisecond). Trying to serve all of these from one system creates a mediocre experience everywhere.
+
+**The trap:** Using Elasticsearch as the source of truth for the product catalog because "we already index there." The index corrupts, you rebuild — from what? **Postgres is the truth; Elasticsearch is the index. Always rebuild-able.**
+
+---
+
+### 3. Black Friday (flash-sale / extreme-burst traffic)
+
+**The workload shape:** Normal traffic 364 days a year, 50–100× spike for hours. The spike is write-heavy (orders, cart updates, inventory decrements) and read-heavy simultaneously (product pages, search, recommendations). The system that survives Monday can't survive Friday without preparation.
+
+**The stack:**
+
+```text
+   Normal path (364 days):
+   App → Postgres → done
+
+   Black Friday path:
+   ┌────────┐     ┌───────┐     ┌──────────┐     ┌──────────┐
+   │  CDN   │────▶│ Redis │────▶│ Kafka    │────▶│ Postgres │
+   │(static)│     │(cache,│     │(order    │     │(eventual │
+   │        │     │ rate  │     │ queue,   │     │ write)   │
+   │        │     │ limit)│     │ decouple)│     │          │
+   └────────┘     └───────┘     └──────────┘     └──────────┘
+```
+
+**The key insight:** You don't scale the database for Black Friday. You **put things in front of it** so it doesn't see Black Friday. CDN for static assets. Redis for session, rate limiting, and inventory cache. Kafka as a buffer between the burst and the database — accept the order into Kafka immediately (fast, durable, horizontally scalable), process it into Postgres asynchronously.
+
+**Why Kafka is the hero here:** It absorbs the write burst. Postgres can process orders at its own pace from the Kafka topic. The user gets "order confirmed" when it hits Kafka, not when it hits Postgres. Eventual consistency between "order accepted" and "order in database" is measured in seconds, which is acceptable.
+
+**The trap:** Trying to scale Postgres horizontally for the spike. Read replicas help reads, but writes still hit the primary. Vertical scaling has a ceiling. **The answer is not a bigger database, it is a queue in front of the same database.**
+
+---
+
+### 4. Search
+
+**The workload shape:** Read-heavy. Users type partial queries and expect results in under 200 ms. The data is semi-structured text (product descriptions, articles, user-generated content). Requirements include fuzzy matching, typo tolerance, faceted filtering, relevance ranking, highlighting, and autocomplete.
+
+**The stack:**
+
+```text
+   ┌──────────┐    CDC / sync     ┌───────────────┐
+   │ Postgres │ ────────────────▶ │ Elasticsearch  │
+   │ (truth)  │                   │ (search index) │
+   └──────────┘                   └───────┬────────┘
+                                          │
+                                   ┌──────┴──────┐
+                                   │   App /     │
+                                   │  Search UI  │
+                                   └─────────────┘
+```
+
+**Why Elasticsearch:** The inverted index is the right data structure. Full-text search, fuzzy matching, n-gram tokenizers for autocomplete, aggregations for faceted navigation — all first-class. Postgres `tsvector` / `pg_trgm` handles simple full-text search surprisingly well up to ~10M rows. Beyond that, or when you need relevance tuning, language-aware analysis, or facets, Elasticsearch is the standard answer.
+
+**Alternatives by scale:**
+- **< 1M documents, simple search:** Postgres `tsvector` + `GIN` index. No extra system.
+- **< 10M documents, product search:** Meilisearch or Typesense — single binary, simpler ops, good relevance out of the box.
+- **> 10M documents, complex requirements:** Elasticsearch or OpenSearch. The ops burden is justified.
+
+**The trap:** Building search on Cassandra or Redis. Cassandra has no full-text search capability. Redis has RediSearch, which works at small scale but is not Elasticsearch. The inverted index exists for a reason — use a system built around it.
+
+---
+
+### 5. Observability (logs, metrics, traces)
+
+**The workload shape:** Extremely high write throughput, append-only, time-series. Reads are either "find a needle" (log search) or "show me a dashboard" (metrics aggregation). Retention is days to months, not years. Cost dominates — observability data is the single largest storage line item at most companies.
+
+**The stack:**
+
+```text
+   ┌───────────────────────────────────────────────────────┐
+   │                    Ingest tier                        │
+   │   Apps → OpenTelemetry Collector → Kafka (buffer)     │
+   └──────────────┬──────────────┬──────────────┬─────────┘
+                  │              │              │
+                  ▼              ▼              ▼
+           ┌──────────┐  ┌──────────┐   ┌──────────┐
+           │  Logs    │  │ Metrics  │   │  Traces  │
+           │          │  │          │   │          │
+           │ Loki /   │  │Prometheus│   │  Tempo / │
+           │ ES /     │  │  / Mimir │   │  Jaeger  │
+           │ClickHouse│  │          │   │          │
+           └──────────┘  └──────────┘   └──────────┘
+                  │              │              │
+                  └──────────────┴──────────────┘
+                              │
+                        ┌──────────┐
+                        │ Grafana  │
+                        │ (query)  │
+                        └──────────┘
+```
+
+**The three pillars, three different systems:**
+- **Metrics** → Prometheus (or Mimir/Thanos for multi-cluster). Time-series, pre-aggregated, tiny storage footprint. PromQL for dashboards and alerts.
+- **Logs** → Loki (cheap, label-indexed, grep-based) or Elasticsearch (expensive, full-text indexed, powerful search). ClickHouse is emerging as the middle ground — cheaper than ES, more query-capable than Loki.
+- **Traces** → Tempo or Jaeger. Append-only, read-by-trace-ID. Object storage (S3) as the backend keeps costs low.
+
+**Why not one system for all three:** Different query patterns. Metrics are "aggregate across time"; logs are "find matching text"; traces are "follow a request ID." A system optimized for one is mediocre at the others. The industry tried "put everything in Elasticsearch" and learned the cost lesson.
+
+**The trap:** Elasticsearch for everything. It works, but at 10× the cost of purpose-built alternatives. Uber's public post on moving logs from ES to ClickHouse cites 10× cost reduction. Grafana Labs built Loki specifically because ES for logs was too expensive for most teams.
+
+---
+
+### 6. Data lake (analytics on raw, heterogeneous data)
+
+**The workload shape:** Ingest everything — structured, semi-structured, raw — at massive scale. Query it later with SQL. Schema evolves over time. Storage costs dominate. Query latency is seconds to minutes, not milliseconds. The users are analysts and data scientists, not end-user applications.
+
+**The stack:**
+
+```text
+   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+   │  App DBs     │  │  Event       │  │  Third-party │
+   │  (CDC)       │  │  streams     │  │  APIs        │
+   └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+          │                 │                 │
+          └────────────┬────┘─────────────────┘
+                       ▼
+               ┌──────────────┐
+               │    Kafka     │
+               │  (ingest bus)│
+               └──────┬───────┘
+                      │
+                      ▼
+               ┌──────────────┐
+               │  S3 / GCS   │ ◀── Parquet / ORC files
+               │  (storage)  │
+               └──────┬───────┘
+                      │
+               ┌──────┴───────┐
+               │ Apache Iceberg│ ◀── table format (schema, partitioning,
+               │  (metadata)  │      time travel, ACID on object storage)
+               └──────┬───────┘
+                      │
+          ┌───────────┼───────────┐
+          ▼           ▼           ▼
+   ┌──────────┐ ┌──────────┐ ┌──────────┐
+   │  Spark   │ │  Trino   │ │ ClickHouse│
+   │ (batch)  │ │(ad-hoc SQL│ │(fast OLAP)│
+   └──────────┘ └──────────┘ └──────────┘
+```
+
+**Why Iceberg on S3:** Storage is separated from compute. S3 costs ~$23/TB/month. Iceberg adds ACID semantics, schema evolution, partition evolution, and time travel on top of dumb object storage. You store once, query from any engine (Spark, Trino, Flink, ClickHouse). This is the modern data lake architecture that has largely replaced HDFS-based Hadoop.
+
+**Why not a traditional database:** At 100 TB+, no database is cost-competitive with Parquet files on S3. ClickHouse is excellent for structured analytics but costs 10–50× more per TB than object storage. The lake stores everything cheaply; ClickHouse or Trino query the parts you care about.
+
+**The trap:** Building a "data lake" that is actually a data swamp — dumping raw JSON into S3 with no schema, no partitioning, no catalog. Six months later, nobody can find or query anything. **Iceberg (or Delta Lake, or Hudi) is the difference between a lake and a swamp. The table format is not optional.**
+
+---
+
+### 7. Leaderboards
+
+**The workload shape:** High-frequency score updates, real-time rank queries. "What is player X's rank?" and "Who are the top 100?" must both be fast. Updates arrive at thousands per second during peak gaming hours.
+
+**The stack:**
+
+```text
+   Game server → Redis ZADD(leaderboard, score, player_id)
+
+   Queries:
+     Top 100        → ZREVRANGE leaderboard 0 99 WITHSCORES
+     Player rank     → ZREVRANK leaderboard player_id
+     Player score    → ZSCORE leaderboard player_id
+     Players near me → ZREVRANGE leaderboard (rank-5) (rank+5)
+```
+
+**Why Redis sorted sets:** This is the canonical answer. `ZADD` is O(log N). `ZREVRANK` is O(log N). A sorted set with 100M members fits in ~6 GB of RAM and answers any of these queries in under 1 ms. No other system comes close for this access pattern.
+
+**Persistent backing:** Redis is RAM. Persist the leaderboard to Postgres on a schedule (every minute or on game-end). If Redis dies, rebuild from Postgres. The leaderboard is a materialized view, not the source of truth.
+
+**Scaling beyond one sorted set:**
+- **Multiple leaderboards** (daily, weekly, all-time): one sorted set per board, TTLs on the daily/weekly ones.
+- **Hundreds of millions of players:** shard by game or region. Redis Cluster distributes sorted sets across nodes.
+- **Historical leaderboards:** snapshot to Postgres or ClickHouse nightly.
+
+**The trap:** Building a leaderboard in Postgres with `SELECT *, RANK() OVER (ORDER BY score DESC) FROM scores`. Works beautifully at 10K rows. At 10M rows, the window function scans the entire table on every query. Redis eliminates this by maintaining the sorted order incrementally.
+
+---
+
+### 8. Fraud detection
+
+**The workload shape:** Real-time decisioning on streaming events. Every transaction must be scored before it's approved — latency budget is 50–200 ms total. The scoring logic needs access to historical aggregates ("how many transactions has this card done in the last hour?") and pattern matching ("is this IP associated with known fraud rings?"). Write-heavy on the event side, read-heavy on the feature side.
+
+**The stack:**
+
+```text
+   ┌──────────┐     ┌──────────┐     ┌────────────────┐     ┌──────────┐
+   │Transaction│────▶│  Kafka   │────▶│ Flink / Spark  │────▶│ Decision │
+   │  event   │     │ (stream) │     │ Streaming      │     │ API      │
+   └──────────┘     └──────────┘     │ (feature calc, │     │(approve/ │
+                                     │  rule engine)  │     │ decline) │
+                                     └───────┬────────┘     └──────────┘
+                                             │
+                              ┌──────────────┼──────────────┐
+                              ▼              ▼              ▼
+                       ┌──────────┐   ┌──────────┐   ┌──────────┐
+                       │  Redis   │   │ Postgres │   │ClickHouse│
+                       │(real-time│   │ (rules,  │   │(historical│
+                       │ counters,│   │ case mgmt│   │ analysis) │
+                       │ features)│   │ review)  │   │          │
+                       └──────────┘   └──────────┘   └──────────┘
+```
+
+**Why this combination:**
+- **Kafka** buffers and distributes the event stream to multiple consumers (scoring, logging, analytics).
+- **Flink or Spark Streaming** computes real-time features: velocity counters ("5 transactions in 2 minutes"), geo-distance checks, pattern matching.
+- **Redis** stores pre-computed features (sliding-window counters, device fingerprint caches, blacklists) for sub-millisecond lookups during scoring.
+- **Postgres** stores the rules configuration, investigation cases, and analyst workflow. Relational and transactional — exactly what case management needs.
+- **ClickHouse** runs historical analysis: "show me all transactions matching this fraud pattern over the last 90 days." OLAP over billions of events.
+
+**The trap:** Trying to do real-time scoring by querying Postgres directly. A `SELECT COUNT(*) FROM transactions WHERE card_id = X AND created_at > now() - interval '1 hour'` is correct but slow under load. **Pre-compute the features into Redis via the stream processor. The scoring path should be lookups, not queries.**
+
+---
+
+### 9. Recommendations ("users who bought X also bought Y")
+
+**The workload shape:** Read-heavy at serving time (every page load triggers a recommendation request), batch-heavy at training time (process the entire interaction history to generate models). The serving path needs sub-100 ms latency. The training path can take hours. These two paths have completely different database needs.
+
+**The stack:**
+
+```text
+   TRAINING PATH (batch, hourly/daily):
+   ┌──────────┐     ┌──────────┐     ┌──────────────┐     ┌──────────┐
+   │ User     │────▶│ Data Lake│────▶│ Spark / ML   │────▶│ Model    │
+   │ events   │     │ (Iceberg │     │ pipeline     │     │ artifacts│
+   │ (Kafka → │     │  on S3)  │     │ (ALS, neural │     │ (S3)     │
+   │  S3)     │     │          │     │  collab filt) │     │          │
+   └──────────┘     └──────────┘     └──────┬───────┘     └──────────┘
+                                            │
+                                            │ precomputed recs
+                                            ▼
+   SERVING PATH (real-time, per request):
+   ┌──────────┐     ┌──────────┐     ┌──────────┐
+   │ App      │────▶│  Redis   │────▶│ Response │
+   │ request  │     │ (lookup  │     │ (top 20  │
+   │          │     │  user →  │     │  items)  │
+   │          │     │  recs)   │     │          │
+   └──────────┘     └──────────┘     └──────────┘
+```
+
+**Why this split:**
+- **Data lake (Iceberg/S3)** stores the raw interaction history (clicks, purchases, ratings). Cheap, queryable, schema-evolving.
+- **Spark** runs collaborative filtering or trains an embeddings model on the full interaction matrix. Batch job, runs nightly or hourly.
+- **Redis** serves the precomputed results. The ML pipeline writes `user_id → [item_1, item_2, ..., item_20]` as a Redis list or sorted set. The serving path is a single `LRANGE` — sub-millisecond.
+
+**For real-time recommendations** (react to what the user is doing right now): add a streaming layer. Kafka captures live events, Flink or Spark Streaming updates feature vectors in Redis, and the serving path blends batch recommendations with real-time signals.
+
+**The trap:** Querying the ML model or the interaction history at serving time. A recommendation request during a page load cannot afford a 500 ms round trip to Spark or a table scan of the interaction history. **Pre-compute and cache. The serving path is a lookup, never a computation.**
+
+---
+
+### 10. Multi-tenant SaaS
+
+**The workload shape:** Many customers (tenants) sharing infrastructure. Each tenant's data must be isolated. Tenants vary wildly in size — the largest 1% generates 50%+ of load. Query patterns are OLTP (the app) plus lightweight analytics (tenant dashboards). Compliance often requires data residency (EU tenant data stays in EU).
+
+**The stack (three models, pick one):**
+
+```text
+   MODEL A: Shared schema, tenant_id column (simplest, most common)
+   ┌─────────────────────────────────┐
+   │         PostgreSQL              │
+   │  ┌─────────────────────────┐   │
+   │  │ orders                  │   │
+   │  │ ├── tenant_id (indexed) │   │
+   │  │ ├── order_id            │   │
+   │  │ └── ...                 │   │
+   │  └─────────────────────────┘   │
+   │  Row-level security (RLS)      │
+   │  enforces isolation            │
+   └─────────────────────────────────┘
+
+   MODEL B: Schema-per-tenant (moderate isolation)
+   ┌─────────────────────────────────┐
+   │         PostgreSQL              │
+   │  ├── tenant_acme.orders        │
+   │  ├── tenant_globex.orders      │
+   │  └── tenant_initech.orders     │
+   └─────────────────────────────────┘
+
+   MODEL C: Database-per-tenant (maximum isolation, highest ops cost)
+   ┌──────────┐  ┌──────────┐  ┌──────────┐
+   │ PG: acme │  │PG: globex│  │PG:initech│
+   └──────────┘  └──────────┘  └──────────┘
+```
+
+**How to choose:**
+- **< 1,000 tenants, uniform size:** Model A. Shared tables, `tenant_id` column, Postgres RLS. Simplest ops, simplest migrations, lowest cost.
+- **1,000–10,000 tenants, some large:** Model A with caching. Redis caches hot tenant data. ClickHouse for tenant-facing analytics dashboards (pre-aggregated per tenant).
+- **Noisy-neighbor risk or compliance isolation:** Model B or C. Schema-per-tenant is a middle ground — one database, separate schemas, `pg_dump` per tenant for portability. Database-per-tenant for regulated industries where auditors want physical separation.
+- **Data residency (EU, etc.):** Model C with region-specific database instances. Or Model A with a routing layer that directs queries to the correct regional Postgres.
+
+**The supporting cast:**
+- **Redis** — cache per-tenant config, session, rate-limit per-tenant API usage.
+- **Kafka** — tenant event stream for async processing (billing events, notifications, audit logs). Partition by tenant_id so per-tenant ordering is preserved.
+- **Elasticsearch** — tenant-facing search. Index per tenant (for isolation) or shared index with tenant_id routing (for efficiency).
+
+**The trap:** Starting with database-per-tenant because "isolation" sounds safe. At 5,000 tenants, you have 5,000 databases to migrate, patch, back up, and monitor. Schema migrations become a week-long rolling operation. **Start with Model A (shared schema + RLS). Graduate large or regulated tenants to Model B/C only when forced.**
+
+---
