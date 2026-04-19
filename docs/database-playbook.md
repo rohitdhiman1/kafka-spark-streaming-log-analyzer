@@ -38,8 +38,8 @@ A scenarios chapter at the end works the other direction: starting from the **pr
 9. [Elasticsearch](#elasticsearch)
 10. [Cassandra](#cassandra)
 11. [Scenarios](#scenarios) — payments, e-commerce, Black Friday, search, observability, data lake, leaderboards, fraud, recommendations, multi-tenant SaaS
-12. Decision flowchart
-13. Anti-pattern hall of fame
+12. [Decision flowchart](#decision-flowchart)
+13. [Anti-pattern hall of fame](#anti-pattern-hall-of-fame)
 
 ---
 
@@ -1709,3 +1709,446 @@ The database sections above work top-down: here is a system, here is what it's g
 **The trap:** Starting with database-per-tenant because "isolation" sounds safe. At 5,000 tenants, you have 5,000 databases to migrate, patch, back up, and monitor. Schema migrations become a week-long rolling operation. **Start with Model A (shared schema + RLS). Graduate large or regulated tenants to Model B/C only when forced.**
 
 ---
+
+<a id="decision-flowchart"></a>
+
+## Decision flowchart
+
+This is the cheat sheet. Start at the top, follow the arrows. It won't replace thinking, but it will get you to the right neighborhood in under a minute — and "right neighborhood" is 90% of the decision.
+
+### The main flow
+
+```text
+                         ┌──────────────────────┐
+                         │   What is the primary │
+                         │   unit of work?       │
+                         └──────────┬────────────┘
+                                    │
+              ┌─────────────────────┼─────────────────────┐
+              ▼                     ▼                     ▼
+     ┌────────────────┐   ┌────────────────┐    ┌────────────────┐
+     │  Single rows / │   │  Streams of    │    │  Billions of   │
+     │  documents     │   │  events        │    │  rows, scanned │
+     │  (OLTP)        │   │  (streaming)   │    │  (OLAP)        │
+     └───────┬────────┘   └───────┬────────┘    └───────┬────────┘
+             │                    │                     │
+             ▼                    ▼                     ▼
+      SEE: OLTP TREE       SEE: STREAMING TREE    SEE: OLAP TREE
+```
+
+---
+
+### OLTP tree — "I read and write individual records"
+
+```text
+   Need transactions / joins / constraints?
+          │
+     ┌────┴─────┐
+     ▼          ▼
+    YES         NO
+     │          │
+     ▼          │
+ ┌────────┐    │    Write-heavy? (>50K writes/sec sustained)
+ │Postgres│    │          │
+ │        │    │     ┌────┴─────┐
+ └────────┘    │     ▼          ▼
+               │    YES         NO
+               │     │          │
+               │     ▼          ▼
+               │  Multi-DC     Need flexible
+               │  active-      queries?
+               │  active?           │
+               │     │         ┌────┴─────┐
+               │  ┌──┴──┐      ▼          ▼
+               │  ▼     ▼     YES         NO
+               │ YES    NO     │          │
+               │  │     │      ▼          ▼
+               │  ▼     ▼   ┌────────┐ ┌──────────┐
+               │ ┌─────────┐│Postgres│ │Cassandra │
+               │ │Cassandra││(still) │ │/ ScyllaDB│
+               │ │/ Scylla ││        │ │          │
+               │ └─────────┘└────────┘ └──────────┘
+               │
+               │  Data fits in RAM? (<100 GB working set)
+               │          │
+               │     ┌────┴─────┐
+               │     ▼          ▼
+               │    YES         NO
+               │     │          │
+               │     ▼          ▼
+               │  ┌────────┐  ┌────────┐
+               │  │ Redis  │  │Postgres│
+               │  │(as     │  │(it     │
+               │  │primary │  │handles │
+               │  │ store? │  │more    │
+               │  │ only if│  │than you│
+               │  │ loss is│  │think)  │
+               │  │ OK)    │  │        │
+               │  └────────┘  └────────┘
+               │
+               └──── When in doubt: Postgres.
+```
+
+**The Postgres default rule:** If you're asking "should I use Postgres?" the answer is almost always yes. Postgres is the wrong answer only when you have a specific, demonstrated reason it can't handle the workload — and that reason is usually one of: (1) write throughput beyond what a single primary can handle, (2) multi-DC active-active, or (3) the workload is pure key-value at extreme scale. Everything else? Postgres.
+
+---
+
+### Streaming tree — "I process events as they arrive"
+
+```text
+   What do you need from the stream?
+          │
+     ┌────┴──────────────┬──────────────────┐
+     ▼                   ▼                  ▼
+   Durable log,       Lightweight        Coordination,
+   replay, high       pub/sub,           leader election,
+   throughput          fire-and-forget    config distribution
+     │                   │                  │
+     ▼                   ▼                  ▼
+  ┌────────┐        ┌────────┐         ┌──────────┐
+  │ Kafka  │        │ Redis  │         │ZooKeeper │
+  │        │        │Pub/Sub │         │/ etcd    │
+  └───┬────┘        │or      │         └──────────┘
+      │             │Streams │
+      │             └────────┘
+      │
+      │  Need stream processing (windowed aggregations,
+      │  joins, pattern matching)?
+      │         │
+      │    ┌────┴─────┐
+      │    ▼          ▼
+      │   YES         NO (just produce/consume)
+      │    │          │
+      │    ▼          ▼
+      │  ┌──────────┐  Kafka consumers
+      │  │Flink /   │  (simple, sufficient
+      │  │Spark     │   for most cases)
+      │  │Streaming │
+      │  └──────────┘
+      │
+      │  Need to store the stream long-term?
+      │         │
+      │    ┌────┴─────┐
+      │    ▼          ▼
+      │   YES         NO
+      │    │          │
+      │    ▼          ▼
+      │  Kafka →     Kafka with
+      │  S3/Iceberg  retention =
+      │  (sink       days/weeks
+      │  connector)
+      │
+      └──── Kafka is the default for durable event streaming.
+            Redis is the default for ephemeral messaging.
+```
+
+---
+
+### OLAP tree — "I scan billions of rows for aggregates"
+
+```text
+   What kind of analytical queries?
+          │
+     ┌────┴───────────────┬──────────────────┐
+     ▼                    ▼                  ▼
+   Real-time            Ad-hoc SQL         Time-series
+   dashboards,          over a data        metrics
+   sub-second           lake (many TB+)    (numeric,
+   aggregations                            pre-aggregated)
+     │                    │                  │
+     ▼                    ▼                  ▼
+  ┌────────────┐    ┌────────────┐     ┌────────────┐
+  │ ClickHouse │    │ Iceberg +  │     │ Prometheus │
+  │            │    │ Trino/Spark│     │ / Mimir    │
+  └────────────┘    └────────────┘     └────────────┘
+                          │
+                          │  Also need full-text search
+                          │  over the same data?
+                          │         │
+                          │    ┌────┴─────┐
+                          │    ▼          ▼
+                          │   YES         NO
+                          │    │          │
+                          │    ▼          ▼
+                          │  ┌──────────┐  Stay with
+                          │  │Elastic-  │  Iceberg +
+                          │  │search    │  Trino/Spark
+                          │  │(for the  │
+                          │  │search    │
+                          │  │part)     │
+                          │  └──────────┘
+                          │
+   Data volume?
+          │
+     ┌────┴─────────────┐
+     ▼                  ▼
+   < 1 TB              > 1 TB
+     │                  │
+     ▼                  ▼
+  Postgres with       ClickHouse or
+  good indexes        Iceberg on S3
+  might still         (depending on
+  be enough           latency needs)
+```
+
+---
+
+### The search spur — "I need to find things by text or complex filters"
+
+```text
+   What kind of search?
+          │
+     ┌────┴───────────────┬──────────────────┐
+     ▼                    ▼                  ▼
+   Full-text,           Exact filters,     Log search
+   fuzzy, autocomplete  facets on          (find errors,
+   relevance-ranked     structured fields  grep by keyword)
+     │                    │                  │
+     ▼                    ▼                  ▼
+   Scale?              ┌────────────┐     Budget?
+     │                 │Elasticsearch│       │
+     │                 │(also good   │  ┌────┴─────┐
+  ┌──┴──────┐          │for this)   │  ▼          ▼
+  ▼         ▼          └────────────┘ Tight       Flexible
+< 10M     > 10M                        │          │
+docs      docs                         ▼          ▼
+  │         │                     ┌────────┐ ┌────────────┐
+  ▼         ▼                     │ Loki   │ │Elasticsearch│
+┌────────┐ ┌────────────┐         │(cheap, │ │(powerful,  │
+│Postgres│ │Elasticsearch│        │label + │ │expensive)  │
+│tsvector│ │/ OpenSearch │        │grep)   │ │            │
+│+ GIN   │ │            │        └────────┘ └────────────┘
+└────────┘ └────────────┘
+```
+
+---
+
+### The caching spur — "I need to make something faster"
+
+```text
+   What are you caching?
+          │
+     ┌────┴───────────────┬──────────────────┐
+     ▼                    ▼                  ▼
+   Query results,       Computed rankings, Static assets,
+   sessions, config,    counters, rate     HTML fragments
+   hot rows             limits
+     │                    │                  │
+     ▼                    ▼                  ▼
+  ┌────────┐          ┌────────┐         ┌────────┐
+  │ Redis  │          │ Redis  │         │  CDN   │
+  │(string/│          │(sorted │         │        │
+  │ hash)  │          │ set,   │         └────────┘
+  └────────┘          │ INCR)  │
+                      └────────┘
+
+   Rule: cache is always in front of a source of truth.
+         Redis is the accelerator. Postgres/Kafka is the vault.
+         If you can't rebuild the cache from the truth, it's not a cache.
+```
+
+---
+
+### Quick-reference decision matrix
+
+For the "I don't want to follow a flowchart, just give me the grid" crowd:
+
+| I need to... | First reach for | Add if needed |
+|---|---|---|
+| Store relational data with transactions | **Postgres** | Read replicas for read scale |
+| Write millions of events/sec, read by key | **Cassandra / ScyllaDB** | Spark/Flink for analytics on top |
+| Buffer/decouple services, event sourcing | **Kafka** | Flink/Spark for stream processing |
+| Cache hot data, sub-ms reads | **Redis** | Postgres as the source of truth behind it |
+| Full-text search, autocomplete, facets | **Elasticsearch** | Postgres as the source of truth behind it |
+| Dashboard aggregations, real-time OLAP | **ClickHouse** | Kafka for ingestion |
+| Collect and alert on numeric metrics | **Prometheus** | Mimir/Thanos for multi-cluster |
+| Store 100 TB+ cheaply, query with SQL | **Iceberg on S3** | Trino or Spark as the query engine |
+| Coordinate distributed systems | **ZooKeeper / etcd** | — |
+| Build a leaderboard | **Redis sorted sets** | Postgres for persistence |
+| Build a queue | **Kafka** (not Cassandra, not Redis) | — |
+
+---
+
+### The one rule that matters more than the flowchart
+
+**Start with Postgres. Add systems when Postgres demonstrably can't handle a specific workload — not when you imagine it might not.** Most applications will never outgrow a well-tuned Postgres instance. The second system you add should solve a problem you've measured, not one you've predicted. Every system you add is a system you operate, monitor, back up, upgrade, and debug at 3 a.m.
+
+---
+
+<a id="anti-pattern-hall-of-fame"></a>
+
+## Anti-pattern hall of fame
+
+The database sections above describe system-specific mistakes. This chapter collects the **cross-cutting** anti-patterns — the ones that transcend any single technology and show up in architecture reviews regardless of stack. Each one has been responsible for outages, cost overruns, or multi-quarter rewrites at real companies. They are ordered roughly by how early in a project they strike.
+
+---
+
+### 1. Résumé-Driven Database Selection
+
+**The pattern:** Choosing a database because the team wants to learn it, because it appeared in a conference talk, or because a FAANG company uses it. The workload is 500 requests per second. The team picks Cassandra because Netflix uses Cassandra.
+
+**Why it hurts:** Every database is a trade-off. The FAANG company chose that database because their workload demanded it — yours almost certainly doesn't. You inherit the operational complexity (ring management, JVM tuning, query-first data modeling) without the workload that justifies it. Six months later the team is debugging compaction storms on a 3-node cluster that Postgres would have handled on a single instance.
+
+**The fix:** Start every database decision with the workload shape, not the technology. Ask: "What is the read/write ratio? What is the query pattern? What happens if this is down for 5 minutes?" If the answer is "it's a web app with relational data and a few hundred QPS," the answer is Postgres. It's always Postgres until it provably isn't.
+
+---
+
+### 2. The Premature Polyglot
+
+**The pattern:** Day-one architecture with six databases: Postgres for users, Cassandra for events, Redis for cache, Elasticsearch for search, Kafka for messaging, ClickHouse for analytics. The team has four engineers.
+
+**Why it hurts:** Each database is a separate ops burden — backups, monitoring, upgrades, security patches, connection pooling, failure modes, on-call runbooks. Four engineers cannot operate six databases well. The cognitive overhead of context-switching between data models (relational, wide-column, key-value, document, columnar) is real. Bugs hide at the seams between systems — stale caches, inconsistent denormalized copies, CDC pipelines that silently lag.
+
+**The fix:** One database until it hurts. Two databases when you can name the specific pain. Three is a mature architecture. Six on day one is a distributed systems PhD program disguised as a startup.
+
+---
+
+### 3. Treating the Cache as the Source of Truth
+
+**The pattern:** Redis holds the canonical copy of the data. There is no rebuild path. "We'll add persistence later."
+
+**Why it hurts:** Redis restarts. Nodes fail. Memory fills. Eviction policies kick in. When the cache disappears, so does the data. "We'll add persistence" never happens because the system works fine — until it doesn't, and there is no recovery path. The team discovers at 2 a.m. that `maxmemory-policy allkeys-lru` has been silently evicting data for weeks.
+
+**The fix:** Every cache must be rebuildable from a source of truth. If you cannot run `FLUSHALL` and have the system recover (slowly, but correctly), your cache is a database and you don't have backups.
+
+**Corollary: the phantom cache.** A cache without TTLs is not a cache — it's an unbounded memory allocation. TTL everything. The default TTL should be short (minutes to hours). Long TTLs are earned by proving the data doesn't change.
+
+---
+
+### 4. The Elasticsearch-as-Database Trap
+
+**The pattern:** Elasticsearch is the only place the product catalog / user profiles / order history lives. No Postgres, no S3, no rebuild path.
+
+**Why it hurts:** Elasticsearch is an index, not a database. It has no transactions, no referential integrity, no real update (every update is delete + re-index). Cluster corruption, split-brain, or a bad mapping change requires reindexing — from what? If the source doesn't exist, the data is gone. Elastic's own documentation says "do not use Elasticsearch as a primary data store."
+
+**The fix:** The source of truth is Postgres (or S3, or Kafka). Elasticsearch is the index. Always maintain a pipeline that can rebuild the index from the source. Test the rebuild regularly — an untested rebuild path is the same as no rebuild path.
+
+---
+
+### 5. The Log Store Cost Bomb
+
+**The pattern:** "We'll put all our logs in Elasticsearch because Kibana looks nice." Three months later, the Elasticsearch cluster is the most expensive line item in the AWS bill. Six months later, it costs more than the application infrastructure it's monitoring.
+
+**Why it hurts:** Elasticsearch stores data in RAM-backed inverted indexes on SSDs. Per-GB cost is 5–20× that of object storage. Most log data is never searched — it's written and then it ages out. You're paying the full-text indexing tax for data nobody will ever full-text search.
+
+**The fix:**
+- **Ask: "Do we need to search this, or just grep it?"** If grep is enough, Loki on S3 is 10–20× cheaper.
+- **Tier your logs.** Hot tier (Elasticsearch, last 24–48 hours) for active debugging. Warm tier (ClickHouse or Loki, last 30 days) for investigation. Cold tier (S3/Parquet, months to years) for compliance.
+- **Stop indexing fields nobody queries.** `dynamic: false` in the mapping. Index the 10 fields you filter on; store the rest as a raw JSON blob.
+
+---
+
+### 6. The Unbounded Query
+
+**The pattern:** `SELECT * FROM events` with no `LIMIT`, no `WHERE`, no pagination. Or the Cassandra equivalent: `SELECT * FROM events_by_user` where one user has 50 million rows. Or the Elasticsearch equivalent: `from: 100000, size: 100`.
+
+**Why it hurts:** The database faithfully does what you asked — reads millions of rows, serializes them, ships them over the network. The coordinator node runs out of memory. The connection pool is exhausted. Other queries time out. One bad query takes down the whole system.
+
+**The fix:**
+- **Every query has a `LIMIT`.** No exceptions. Default pagination at the API layer.
+- **In Cassandra:** bound your partition size. If a partition can grow unbounded, add a bucketing dimension to the partition key.
+- **In Elasticsearch:** use `search_after` for deep pagination, never `from` + `size` beyond 10K.
+- **In Postgres:** statement timeouts (`statement_timeout = '30s'`) as a safety net. `pg_stat_statements` to find the offenders before they page you.
+
+---
+
+### 7. Schema? What Schema?
+
+**The pattern:** "We'll use a schemaless database so we don't have to think about the schema." Data flows in as arbitrary JSON. Fields appear and disappear. Types drift (`age` is sometimes a string, sometimes an integer). Three months later, every consumer is a maze of null checks and type coercions.
+
+**Why it hurts:** "Schemaless" doesn't mean "no schema" — it means "the schema is implicit, undocumented, and enforced by the application code instead of the database." Every service that reads this data carries its own copy of the schema assumptions, and they drift. The mapping explosion in Elasticsearch. The deserialization failures in Spark. The silent data corruption when a field changes type.
+
+**The fix:** Define your schema explicitly, always, regardless of database:
+- **Elasticsearch:** `dynamic: strict` from day one.
+- **Kafka:** Schema Registry with Avro or Protobuf. Reject messages that don't conform.
+- **MongoDB / document stores:** JSON Schema validation at the collection level.
+- **Data lakes:** Iceberg / Delta Lake with enforced schemas and schema evolution rules.
+
+The database doesn't have to enforce the schema (though it should). But the schema must exist, be documented, and be versioned.
+
+---
+
+### 8. The DIY Queue on the Wrong Database
+
+**The pattern:** Building a job queue by polling a Postgres table (`SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED`). Or building a queue on Cassandra (write row, read row, delete row). Or building a queue on Redis lists without acknowledging the durability trade-off.
+
+**Why it hurts:**
+- **Postgres queue:** Works surprisingly well up to ~1,000 jobs/sec. Beyond that, the polling, row locking, and index bloat from constant insert/update/delete cycles degrade the table and compete with your OLTP workload. The `jobs` table becomes the hottest table in the database.
+- **Cassandra queue:** Tombstone storm. Every dequeued (deleted) message leaves a tombstone. Reads slow to a crawl. This is the #1 Cassandra anti-pattern.
+- **Redis list queue:** Fast, but if Redis restarts, in-flight jobs disappear. `BRPOPLPUSH` with a processing list helps, but at-least-once delivery requires application-level retry logic.
+
+**The fix:** Use a purpose-built system:
+- **< 1,000 jobs/sec, already have Postgres:** `SKIP LOCKED` is fine. Accept the trade-off. Isolate the queue in its own table, vacuum aggressively.
+- **Durable, high-throughput, ordered:** Kafka. Consumer groups give you exactly-once semantics with offset management.
+- **Task queue with retry, scheduling, priorities:** SQS, RabbitMQ, or Celery (which uses Redis/RabbitMQ as a broker but handles the hard parts).
+
+---
+
+### 9. The Cross-Database Join
+
+**The pattern:** User data lives in Postgres. Activity data lives in Cassandra. The product manager asks for a report: "Show me all users who signed up last month and their activity count." The engineer writes code that fetches users from Postgres, then loops over each user querying Cassandra one by one. N+1 queries across two databases over the network.
+
+**Why it hurts:** This is O(N) network round trips to a database that doesn't support the query natively. Latency is dominated by network hops. At 100K users, it takes minutes. At 1M users, it doesn't finish. The "join" logic lives in application code that is fragile, slow, and untested at scale.
+
+**The fix:**
+- **If you need to join, the data should be in the same system.** Denormalize into one database, or CDC both sources into a data lake (Iceberg) and join there with Spark or Trino.
+- **If the join is for analytics:** this is an OLAP question. Export both datasets to ClickHouse or the data lake. Don't make the OLTP systems do OLAP work.
+- **If the join is for real-time serving:** pre-compute and materialize. A Kafka Streams or Flink job that joins the two streams and writes the result to a serving store (Redis, Postgres).
+
+---
+
+### 10. Ignoring the Operational Cost
+
+**The pattern:** The architecture review evaluates databases on features, performance benchmarks, and license cost. Nobody asks: "Who operates this at 3 a.m.? What does the upgrade path look like? How do we back this up? What happens when a node dies?"
+
+**Why it hurts:** The total cost of a database is 20% license/infra and 80% operations. A "free" open-source database that requires a dedicated DBA costs more than a managed service. A self-hosted Elasticsearch cluster that pages the on-call engineer weekly is more expensive than Elastic Cloud, even at 3× the infrastructure cost. The cheapest database is the one your team can operate without heroics.
+
+**The fix:** For every database in the architecture, answer these questions before committing:
+- Who is on call for this system?
+- What does failover look like? Is it automatic or does someone wake up?
+- How long does a version upgrade take? Does it require downtime?
+- How do you back up and restore? Have you tested the restore?
+- What happens at 2× current load? 10×?
+- Can you hire people who know this system?
+
+If the answer to most of these is "we'll figure it out," use the managed service or pick a simpler system.
+
+---
+
+### 11. The Consistency Mismatch
+
+**The pattern:** The application assumes strong consistency but the database provides eventual consistency. Or: the application doesn't need strong consistency but pays the latency cost for it anyway.
+
+**Why it hurts:**
+- **Assuming strong on an eventually consistent system:** A user updates their profile in Cassandra with `CL=ONE`, immediately reads it back from a different replica, gets the old value, and sees a "lost update." The bug is intermittent, hard to reproduce, and looks like a ghost. Or: an inventory decrement in a last-write-wins system, where two concurrent decrements both read "5", both write "4", and you've just sold an item you don't have.
+- **Paying for strong when you don't need it:** Using `CL=ALL` in Cassandra for a display-name update that could tolerate 2 seconds of staleness. One slow replica and the write fails. Availability sacrificed for consistency that nobody needed.
+
+**The fix:** Map every data path to its consistency requirement:
+- **Financial, inventory, authentication:** strong consistency. Use Postgres, or Cassandra with LWTs (and accept the cost).
+- **Display data, recommendations, activity feeds:** eventual consistency is fine. Use `LOCAL_QUORUM` or even `ONE` in Cassandra. Cache in Redis with a short TTL.
+- **Mixed:** different tables or different services with different consistency levels. The payment service uses Postgres. The activity feed uses Cassandra. They are different systems because they have different requirements.
+
+---
+
+### 12. The Backup That Was Never Tested
+
+**The pattern:** Backups run nightly. They've run for two years. Nobody has ever restored one. The disaster strikes. The backup is corrupt, incomplete, or restores to the wrong schema version. Or: the backup is fine, but the restore takes 48 hours, and the business expected 4.
+
+**Why it hurts:** A backup you haven't restored is a hypothesis. At the moment you need it most — data loss, corruption, ransomware — you discover the hypothesis was wrong. This is not a database-specific problem. It applies to Postgres `pg_dump`, Cassandra snapshots, Elasticsearch snapshots, Redis RDB files, and every other system in this doc.
+
+**The fix:**
+- **Test restores quarterly.** Restore to a staging environment. Verify the data is correct and complete. Time the restore.
+- **RTO/RPO are not aspirations, they are SLAs.** Recovery Time Objective (how long) and Recovery Point Objective (how much data loss). Measure them. If the RTO is 1 hour but the restore takes 12, you have a problem today, not the day of the disaster.
+- **Backups are not disaster recovery.** A backup on the same disk as the database is not a backup. A backup in the same region as the database is not a disaster recovery plan. Geo-replicate.
+
+---
+
+### The meta-lesson
+
+Every anti-pattern in this list has the same root cause: **optimizing for the easy thing (features, performance, novelty) and ignoring the hard thing (operations, failure modes, consistency, cost at scale).** The hard things don't show up in the demo. They show up at 3 a.m. on a Saturday, when the system is down, the runbook doesn't exist, and the person who chose the database left the company two years ago.
+
+The best database decision is the boring one that nobody has to think about again.
+
+---
+
+*End of the Database Playbook.*
